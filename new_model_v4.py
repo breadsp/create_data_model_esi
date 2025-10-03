@@ -22,6 +22,16 @@ def create_examples_string(examples):
     for row_idx in examples.index:
         examples_str += f"# {examples.loc[row_idx,'question']}\n{examples.loc[row_idx,'cypher']}\n\n"
     return examples_str
+def contains_edit_keywords(cypher_query):
+    edit_keywords = [
+        "CREATE", "MERGE", "SET", "DELETE", "REMOVE",
+        "CREATE INDEX", "DROP INDEX", "CREATE CONSTRAINT", "DROP CONSTRAINT", "FOREACH"
+    ]
+    # Check for each keyword (case-insensitive)
+    for kw in edit_keywords:
+        if re.search(rf"\b{kw}\b", cypher_query, re.IGNORECASE):
+            return True
+    return False
 
 cypher_examples_str = create_examples_string(train_df)    
 
@@ -148,9 +158,16 @@ if st.session_state.repeat_loop:
             with st.spinner("Generating response..."):
                 results = chain.invoke({"question": curr_query, "schema": schema, "cypher_examples": cypher_examples_str})
                 cypher_query = results['intermediate_steps'][0]['query']
-                st.sidebar.header("Generated Cypher Query")
-                wrapped_query = smart_wrap_code(cypher_query)
-                st.sidebar.code(wrapped_query, language='cypher')
+                if contains_edit_keywords(cypher_query):
+                    st.sidebar.warning("Edit keywords detected in Cypher query! Query will not be executed.")
+                    st.write("Your query contains database editing commands and will not be run.")
+                    print("Blocked query due to edit keywords:", cypher_query)
+                else:
+                    # Safe to run the query
+                    st.sidebar.header("Generated Cypher Query")
+                    wrapped_query = smart_wrap_code(cypher_query)
+                    st.sidebar.code(wrapped_query, language='cypher')
+                    # ...run the query and display results as before...
                 print("Raw results:", results)
                 result_df = pd.DataFrame(results["result"])
                 result_text = results["result"]
