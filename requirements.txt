@@ -1,7 +1,8 @@
 tabulate
 pandas
-time
-tabulate
 openpyxl
+langchain-core
 langchain_community
+streamlit
+streamlit_chat
 streamlit_chatbox
