@@ -1,0 +1,7 @@
+tabulate
+pandas
+time
+tabulate
+openpyxl
+langchain_community
+streamlit_chatbox

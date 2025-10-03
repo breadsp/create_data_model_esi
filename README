@@ -1,0 +1,9 @@
+1. Install requirements file using copilot
+2. Change file paths at
+    excel_to_json.py line 5:  df = pd.read_excel(r"/Users/davenportaw/Projects/create_data_model_esi/sample_queries.xlsx")
+    new_model_v4.py line 18:  train_df = pd.read_excel(r"/Users/davenportaw/Projects/create_data_model_esi/sample_queries.xlsx")
+3. install OLLAMA
+4. use OLLAMA to install llama3.2
+5. run 'ollama run llama3.2' in a terminal
+6. in a seperate terminal 'streamlit run new_model_v4.py'
+

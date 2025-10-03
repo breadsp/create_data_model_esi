@@ -9,9 +9,13 @@ from langchain_core.prompts import PromptTemplate
 import pandas as pd
 import time
 from tabulate import tabulate
+import streamlit as st
+from streamlit_chat import message
+from streamlit.components.v1 import html
+import re
 
 # load the training data which will be passed to the template
-train_df = pd.read_excel(r"C:\Users\breadsp2\Desktop\olloma testing\sample_queries.xlsx")
+train_df = pd.read_excel(r"/Users/davenportaw/Projects/create_data_model_esi/sample_queries.xlsx")
 
 def create_examples_string(examples):
     examples_str = ""
@@ -86,7 +90,7 @@ from langchain_community.chains.graph_qa.cypher import GraphCypherQAChain
 from langchain_ollama import ChatOllama
 
 # 1. Initialize your graph database connection
-graph = Neo4jGraph(url="neo4j://127.0.0.1:7687", username="neo4j", password="SubmitterData2025!")
+graph = Neo4jGraph(url="neo4j://127.0.0.1:7687", username="neo4j", password="popsciLoader")
 
 # 2. Get the schema
 schema = graph.get_schema
@@ -114,7 +118,12 @@ chain = GraphCypherQAChain.from_llm(
     return_direct=True,
     input_key="question")
 
-
+def smart_wrap_code(code):
+    # Add a newline before Cypher keywords
+    keywords = ["MATCH", "WHERE", "WITH", "RETURN", "ORDER BY", "LIMIT",","]
+    for kw in keywords:
+        code = re.sub(rf"\s*{kw}\s*", f"\n{kw} ", code)
+    return code
 # 4. Invoke the chain with few-shot examples
 #query_list = ["how many particpants are in each study?", "how many studies have at least 5000 male participants",
 #              "summerize participant counts by sex and race"]
@@ -124,42 +133,60 @@ chain = GraphCypherQAChain.from_llm(
 #             ]
 
 
-repeat_loop = True
+if "repeat_loop" not in st.session_state:
+    st.session_state.repeat_loop = True
 
-if repeat_loop:
-    try:
-        print('\x0c')
-        print("Welcome I am an AI program that can take a question, query my database and return an answer if applicable")
-        curr_query = input('How can I help you today? \n')
-        start_timer = time.perf_counter()
-        results = chain.invoke({"question": curr_query, "schema": schema, "cypher_examples": cypher_examples_str})
-        print("\n\n")
+st.write("Welcome I am an AI program that can take a question, query my database and return an answer if applicable")
+st.write("How can I help you today?")
 
-        print("Here is a summary: \n")
-        
-        result_df = pd.DataFrame(results["result"])
-        result_df.drop_duplicates(inplace=True)    
-        print(f"the question that was asked:\n{results['question']}\n")
-        print(f"The Generated Cypher Response:\n{results['intermediate_steps'][0]['query']}\n")
-        
-        if len(result_df) > 0:
-            print("Tabulated output for the results of the cypher response")
-            print(tabulate(result_df, headers='keys', tablefmt="rounded_grid", maxcolwidths=30))
-        else:
-            print("I was able to create a cypher query based on your question")
-            print("Unfortunately it returned 0 results")
-        
-        end_timer = time.perf_counter()
-        print(f"Your question took {end_timer - start_timer:.2f} seconds to process \n")
-    except Exception:
-        print("I was unable to generate a valid cyper query based on your question")
-        print("Please check for spelling or filtering criteria to ensure the question was asked correctly")
-    finally:
-        answer = input("\nWould you like to ask another question?")
-        if answer.lower() == 'yes':
-            repeat_loop = True
-        else:
-            repeat_loop = False
-
-print("thank you for using my program, hopefully I was able to answer all your questions")
-print("Goodbye...")
+if st.session_state.repeat_loop:
+    curr_query = st.text_input("User Input:", key="user_input")
+    if st.button("Submit Question"):
+        try:
+            print("User question:", curr_query)
+            start_timer = time.perf_counter()
+            with st.spinner("Generating response..."):
+                results = chain.invoke({"question": curr_query, "schema": schema, "cypher_examples": cypher_examples_str})
+                cypher_query = results['intermediate_steps'][0]['query']
+                st.sidebar.header("Generated Cypher Query")
+                wrapped_query = smart_wrap_code(cypher_query)
+                st.sidebar.code(wrapped_query, language='cypher')
+                print("Raw results:", results)
+                result_df = pd.DataFrame(results["result"])
+                result_text = results["result"]
+                result_df.drop_duplicates(inplace=True)
+                print(f"the question that was asked:\n{results['question']}\n")
+                print(f"The Generated Cypher Response:\n{results['intermediate_steps'][0]['query']}\n")
+                print("Result DataFrame:\n", result_df)
+                st.write(f"the question that was asked:\n{results['question']}\n")
+                st.write(f"The Generated Cypher Response:\n{results['intermediate_steps'][0]['query']}\n")
+                st.write(result_df)
+                if len(result_df) > 0:
+                    print("Tabulated output for the results of the cypher response")
+                    print(tabulate(result_df, headers='keys', tablefmt="rounded_grid", maxcolwidths=30))
+                    st.write(result_text)
+                else:
+                    print("I was able to create a cypher query based on your question")
+                    print("Unfortunately it returned 0 results")
+                    st.write("Unfortunately it returned 0 results")
+                end_timer = time.perf_counter()
+                print(f"Your question took {end_timer - start_timer:.2f} seconds to process \n")
+                st.write(f"Your question took {end_timer - start_timer:.2f} seconds to process \n")
+        except Exception as e:
+            print("Exception:", e)
+            print("I was unable to generate a valid cyper query based on your question")
+            print("Please check for spelling or filtering criteria to ensure the question was asked correctly")
+            st.write("I was unable to generate a valid cyper query based on your question")
+            st.write("Please check for spelling or filtering criteria to ensure the question was asked correctly")
+        # Ask if user wants to continue
+        if st.button("Ask Another Question"):
+            st.session_state.user_input = ""  # Clear input for next question
+            st.session_state.repeat_loop = True
+        if st.button("End Session"):
+            print("Failed to click the button")
+            st.session_state.repeat_loop = False
+if st.session_state.repeat_loop == False:
+    st.write("thank you for using my program, hopefully I was able to answer all your questions")
+    st.write("Goodbye...")
+    print("thank you for using my program, hopefully I was able to answer all your questions")
+    print("Goodbye...")

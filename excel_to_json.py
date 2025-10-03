@@ -2,7 +2,7 @@ import pandas as pd
 import json
 
 # Load the Excel file
-df = pd.read_excel(r"C:\Users\breadsp2\Desktop\olloma testing\sample_queries.xlsx")
+df = pd.read_excel(r"/Users/davenportaw/Projects/create_data_model_esi/sample_queries.xlsx")
 
 # Convert DataFrame to JSON format
 # orient='records' creates a list of dictionaries, where each dictionary represents a row
