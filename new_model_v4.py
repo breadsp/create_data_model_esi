@@ -162,22 +162,23 @@ if st.session_state.repeat_loop:
                     st.sidebar.warning("Edit keywords detected in Cypher query! Query will not be executed.")
                     st.write("Your query contains database editing commands and will not be run.")
                     print("Blocked query due to edit keywords:", cypher_query)
+                    raise Exception("Edit keywords detected in Cypher query.")
                 else:
                     # Safe to run the query
                     st.sidebar.header("Generated Cypher Query")
                     wrapped_query = smart_wrap_code(cypher_query)
                     st.sidebar.code(wrapped_query, language='cypher')
                     # ...run the query and display results as before...
-                print("Raw results:", results)
-                result_df = pd.DataFrame(results["result"])
-                result_text = results["result"]
-                result_df.drop_duplicates(inplace=True)
-                print(f"the question that was asked:\n{results['question']}\n")
-                print(f"The Generated Cypher Response:\n{results['intermediate_steps'][0]['query']}\n")
-                print("Result DataFrame:\n", result_df)
-                st.write(f"the question that was asked:\n{results['question']}\n")
-                st.write(f"The Generated Cypher Response:\n{results['intermediate_steps'][0]['query']}\n")
-                st.write(result_df)
+                    print("Raw results:", results)
+                    result_df = pd.DataFrame(results["result"])
+                    result_text = results["result"]
+                    result_df.drop_duplicates(inplace=True)
+                    print(f"the question that was asked:\n{results['question']}\n")
+                    print(f"The Generated Cypher Response:\n{results['intermediate_steps'][0]['query']}\n")
+                    print("Result DataFrame:\n", result_df)
+                    st.write(f"the question that was asked:\n{results['question']}\n")
+                    st.write(f"The Generated Cypher Response:\n{results['intermediate_steps'][0]['query']}\n")
+                    st.write(result_df)
                 if len(result_df) > 0:
                     print("Tabulated output for the results of the cypher response")
                     print(tabulate(result_df, headers='keys', tablefmt="rounded_grid", maxcolwidths=30))
