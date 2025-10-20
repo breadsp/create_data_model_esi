@@ -4,26 +4,51 @@ Created on Tue Sep 16 09:11:25 2025
 
 @author: breadsp2
 """
-from langchain_core.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate # type: ignore
 import pandas as pd
 import time
 import re
-import sys
-from langchain_core.exceptions import OutputParserException
 from langchain_neo4j import GraphCypherQAChain
 from langchain_ollama import ChatOllama
 from langchain_neo4j import Neo4jGraph
-from langchain.callbacks.base import BaseCallbackHandler
-from typing import Any #, Dict
-from tabulate import tabulate
 import streamlit as st
-from streamlit_chat import message
-from streamlit.components.v1 import html
 from neo4j import GraphDatabase
 
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_USERNAME = "neo4j"
-NEO4J_PASSWORD = "aitestingdata2025"
+NEO4J_PASSWORD = "SubmitterData2025!"
+#NEO4J_PASSWORD = "aitestingdata2025"
+
+# Define a style block to center the title
+title_alignment = """
+    <style>
+    .centered-title {
+        text-align: center;
+    }
+    </style>
+"""
+
+st.markdown(title_alignment, unsafe_allow_html=True)
+st.markdown(
+        """
+        <style>
+        .block-container {
+            padding-top: 0rem; /* Adjust this value as needed */
+            padding-left: 1rem;
+            padding-right: 1rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True)
+
+st.markdown("<h1 style='text-align: center; color: black; font-size: 30px;'>PopSci AI: Query Database from User Input</h1>", unsafe_allow_html=True)
+########################################################
+## this is where the program starts
+st.text("Welcome, I am an AI program that can take your question and query my database.\n" +
+         "If I am able to generate valid code I will return an answer to your question")
+st.text("How can I help you today?")
+placeholder = st.empty()
+output_block = st.empty()
 
 # 1. Initialize your graph database connection
 if "graph" not in st.session_state:
@@ -38,15 +63,13 @@ if "driver" not in st.session_state:
 
 st.set_page_config(
     page_title="PopSci AI Interface: Text to Cypher",
-    layout="centered",
+    layout= "wide", #"centered",
     initial_sidebar_state="expanded")
 
-st.sidebar.header("Generated Cypher Query")
-if "last_results" in st.session_state: 
-    st.sidebar.code(st.session_state.last_results, language='cypher')
+st.sidebar.header("Users History")
 
-# load the training data which will be passed to the template
-#train_df = pd.read_excel(r"/Users/davenportaw/Projects/create_data_model_esi/sample_queries.xlsx")
+###############################################################
+## functions to use in the program
 def contains_edit_keywords(cypher_query):
     edit_keywords = [
         "CREATE", "MERGE", "SET", "DELETE", "REMOVE",
@@ -85,15 +108,94 @@ def display_error_line(ex):
         tb = tb.tb_next
     print(str({'type': type(ex).__name__, 'message': str(ex), 'trace': trace}))
 
+def correct_cypher(cypher_query):
+    cypher_query = cypher_query.replace("participant_sex", "sex")
+    cypher_query = cypher_query.replace("participant_race", "race")
+    cypher_query = cypher_query.replace("participant_ethnicity", "ethnicity")
+    cypher_query = cypher_query.replace("!=", "<>")
+    cypher_query = cypher_query.replace('ANY(term IN ["cancer"] WHERE tolower(p.cancer_diagnosis_primary_site) CONTAINS term)', 
+                                        "p.participant_case_indicator = 'Yes'")
+    
+    if "WITH s, COUNT(p) as Total_Participants" in cypher_query:
+        cypher_query = cypher_query.replace("WITH s, COUNT(p) as Total_Participants","")
+        cypher_query = cypher_query.replace("Total_Participants","COUNT(p) as Total_Participants")
+    return cypher_query
+
+def smart_wrap_code(code):
+    # Add a newline before Cypher keywords
+    keywords = ["MATCH", "WHERE", "WITH", "RETURN", "ORDER BY", "LIMIT",","]
+    for kw in keywords:
+        code = re.sub(rf"\s*{kw}\s*", f"\n{kw} ", code)
+    return code
+
+def get_query_data(tx, query):
+    result = tx.run(query)
+    data_list = [i for i in result.data()]
+    return data_list
+
+def update_side_bar(curr_query, cypher_query, curr_results):
+
+    #st.sidebar.header("Users History")
+    wrapped_query = smart_wrap_code(cypher_query)
+    if len(curr_query):
+        new_df = pd.DataFrame({"Query":[curr_query], "Cypher":[wrapped_query], "Results":[curr_results]})
+        new_df = pd.concat([st.session_state.result_history, new_df])
+        new_df = new_df.reset_index(drop=True)
+        new_df.drop_duplicates("Query", keep="last", inplace=True)
+        st.session_state.result_history = new_df
+    
+    if len(st.session_state.result_history) > 0:
+        st.session_state.result_history.drop_duplicates("Query", keep="last", inplace=True)
+    
+        for curr_idx in st.session_state.result_history.index:  
+            input_question = st.session_state.result_history.loc[curr_idx, "Query"]
+            output_cypher = st.session_state.result_history.loc[curr_idx, "Cypher"]
+            output_results = st.session_state.result_history.loc[curr_idx, "Results"]
+
+            if len(input_question) > 0:
+                try:
+                    if(st.sidebar.button(input_question,  key= "question_" + str(curr_idx))):
+                        print(f"question_{curr_idx} was pushed from update")
+                except Exception as e:
+                    pass  #function throws error on first pass, but works on second
+                    print("unable to make new button?")
+                    print(input_question)
+                    print("question_" + str(curr_idx))
+                #    st.sidebar.code(output_cypher, language='cypher')
+                #    if len(output_results[0]) > 0:
+                #        st.sidebar.dataframe(output_results[0])
+                #    else:
+                #        st.sidebar.write("No Results were found")
+                #    ask_another()
+
+            #st.sidebar.text(f"Users Question: \n {st.session_state.last_query[curr_idx]}")
+                #st.sidebar.code(st.session_state.last_code[curr_idx], language='cypher')
+
+def disable(status, new_question):
+    st.session_state.input_disabled = status
+    st.session_state.new_question = new_question
+
+def toggle_another(status):
+    st.session_state.another_disabled = status
+
+def ask_another():
+    if st.button("Ask Another Question",  key= "another_question",  on_click=disable, args=(False,True),
+                 disabled = st.session_state.another_disabled):
+        toggle_another(True)  #disable the ask another after clicking
+        st.session_state.repeat_loop = True
+
+def clear_input_box():
+    st.session_state.user_input = ""  # Clear input for next question
+    st.session_state.new_question = False
+##################################################################
+## convert training data into prompt format
 if "cypher_examples_str" not in st.session_state:
     train_df = pd.read_excel(r"C:\Users\breadsp2\Desktop\olloma testing\sample_queries.xlsx", sheet_name=None)
 
     all_training_data = convert_training_data(train_df)
     st.session_state.cypher_examples_str = create_examples_string(all_training_data) 
-
 ################################################################################
 # create the template that will be used by the model
-
 custom_cypher_prompt_template = """
 You are an expert Cypher developer. Your task is to generate a valid Cypher query for a graph database based on the user's question and the provided schema.
 
@@ -114,8 +216,6 @@ If age is being requested, then take age_at_entrolment / 365 for the filter crit
 
 DO NOT USE the function lower()
 If a WITH statement is used the only variables in the WITH statement can be passed onto the WHERE and RETURN statements
-Relationships can not be in a RETURN statment, they can only be used in a MERGE
-COUNT can not be used in a WHERE statement, should only be used in a RETURN
 
 Always use the tolower() function to ensure case-insensitive matching for string variables.
 Always use the tofloat() for numeric variables.
@@ -144,11 +244,8 @@ Do not include any explanations or apologies in your response.
 Respond with a Cypher statement only!
 """
 #################################################################################
-#Use contains(x) for the following variables: race, ethnicity, cancer_diagnosis_primary_site and cancer_diagnosis_disease_morphology 
 
 prompt = PromptTemplate.from_template(custom_cypher_prompt_template)
-
-# 2. Get the schema
 schema = st.session_state.graph.get_schema
 
 # remove variabes from the schema that serve as place holders and should not be used in any query
@@ -162,10 +259,14 @@ for i in remove_list:
     
 schema = schema.replace(", ,", ", ")
 
-# 3. Create the full QA chain
+if "result_history" not in st.session_state:
+    st.session_state.result_history = pd.DataFrame()
+
 if "chain" not in st.session_state:
     st.session_state.chain = GraphCypherQAChain.from_llm(
         llm = ChatOllama(temperature=0, model="llama3.2"),
+        #llm = ChatOllama(temperature=0, model="tomasonjo/llama3-text2cypher-demo"),
+        
         graph=st.session_state.graph,
         verbose=True,   #this prints the generated cypher, but does not save
         allow_dangerous_requests=True,
@@ -176,134 +277,128 @@ if "chain" not in st.session_state:
 
     st.session_state.chain.cypher_query_corrector = None
 
-def correct_cypher(cypher_query):
-    cypher_query = cypher_query.replace("participant_sex", "sex")
-    cypher_query = cypher_query.replace("participant_race", "race")
-    cypher_query = cypher_query.replace("participant_ethnicity", "ethnicity")
-    return cypher_query
-
-def smart_wrap_code(code):
-    # Add a newline before Cypher keywords
-    keywords = ["MATCH", "WHERE", "WITH", "RETURN", "ORDER BY", "LIMIT",","]
-    for kw in keywords:
-        code = re.sub(rf"\s*{kw}\s*", f"\n{kw} ", code)
-    return code
-# 4. Invoke the chain with few-shot examples
-#query_list = ["how many particpants are in each study?", "how many studies have at least 5000 male participants",
-#              "summerize participant counts by sex and race"]
-#query_list = ["How many participants have kidney cancer?",
-#              "List all ethnicities for each study",
-#              "How many particpants are female, black and between 35 and 45 years old?"
-#             ]
-
-def get_query_data(tx, query):
-    result = tx.run(query)
-    data_list = [i for i in result.data()]
-    return data_list
-
-def update_side_bar(curr_query, cypher_query):
-    #st.sidebar.header("Generated Cypher Query")
-    wrapped_query = smart_wrap_code(cypher_query)
-    if "last_query" not in st.session_state:
-        st.session_state.last_query = [curr_query]
-    else:
-        st.session_state.last_query = st.session_state.last_query + [curr_query]
-    
-    if "last_code" not in st.session_state:
-        st.session_state.last_code = [wrapped_query]
-    else:
-        st.session_state.last_code = st.session_state.last_code + [wrapped_query]
-     
-    for curr_idx in range(0,len(st.session_state.last_query)):   
-        if len(st.session_state.last_query[curr_idx]) > 0:
-            st.sidebar.text(f"Users Question: \n {st.session_state.last_query[curr_idx]}")
-            st.sidebar.code(st.session_state.last_code[curr_idx], language='cypher')
-
 if "repeat_loop" not in st.session_state:
     st.session_state.repeat_loop = True
-
-# Define a style block to center the title
-title_alignment = """
-    <style>
-    .centered-title {
-        text-align: center;
-    }
-    </style>
-"""
-st.markdown(title_alignment, unsafe_allow_html=True)
-st.markdown("<h1 class='centered-title'>PopSci AI: Query Database from User Input</h1>", unsafe_allow_html=True)
-
-st.write("Welcome I am an AI program that can take a question, query my database and return an answer if applicable")
-st.write("How can I help you today?")
-
-def disable(status):
-    st.session_state.input_disabled = status
 
 if "input_disabled" not in st.session_state:
     st.session_state.input_disabled = False
 
+if "another_disabled" not in st.session_state:
+    st.session_state.another_disabled = True
 
-if st.session_state.repeat_loop:
-    curr_query = ""
-    cypher_query = ""
-    update_side_bar(curr_query, cypher_query)
-    curr_query = st.text_input("User Input:", key="user_input", 
-                               disabled=st.session_state.input_disabled)  
+if "new_question" not in st.session_state:
+    st.session_state.new_question = False
 
-    if st.button("Submit Question", key= "sub_question", on_click=disable, args=(True,),
-                 disabled=st.session_state.input_disabled):   #if clicked then disable input and button
-        try:
-            #print("User question:", curr_query)
-            start_timer = time.perf_counter()
-            with st.spinner("Generating response..."):
-                # keeps trying to run the query, but if invaid will cause an error
-                results = st.session_state.chain.invoke({"query": curr_query, "schema": schema,
-                                                         "cypher_examples": st.session_state.cypher_examples_str})
-                cypher_query = results['intermediate_steps'][0]['query']
-                #print(cypher_query)
-                if contains_edit_keywords(cypher_query):
-                    cypher_query = "\nEdit keywords detected in Cypher query! Query will not be executed.\n"
-                    #st.sidebar.warning("Edit keywords detected in Cypher query! Query will not be executed.")
-                    st.write("Your query contains database editing commands and will not be run.")
-                    print("Blocked query due to edit keywords:", cypher_query)
-                    update_side_bar(curr_query, cypher_query)
-                else:
-                    cypher_query = correct_cypher(cypher_query)
-                    update_side_bar(curr_query, cypher_query)
+with placeholder.container(border=True):
+    if st.session_state.new_question == True:
+        clear_input_box()
+        print(f"input_var: {st.session_state.user_input}")
+        toggle_another(True)
+    if st.session_state.repeat_loop:
+        curr_query = ""
+        cypher_query = ""
+        result_list = []
 
-                    try:
-                        #print("Raw results:", results)
-                        with st.session_state.driver.session() as session:
-                            records = session.execute_read(get_query_data, cypher_query)
-                            result_df = pd.DataFrame(records)
-                            result_df.drop_duplicates(inplace=True)
-                            if len(result_df) > 0:
-                                st.write(result_df)
+        #update_side_bar(curr_query, cypher_query, result_list, cypher_code, result_table)
+        curr_query = st.text_input("User Input:", key="user_input",  disabled=st.session_state.input_disabled)  
+        col_1, col_2, col_3 = st.columns([4,4,2], border=False)
+        with col_1:
+            if st.button("Submit Question", key= "sub_question", on_click=disable, args=(True,False,),
+                        disabled=st.session_state.input_disabled):   #if clicked then disable input and button
+                try:
+                    toggle_another(True)
+                    print("User question:", curr_query)
+                    start_timer = time.perf_counter()
+                    with st.spinner("Generating response..."):
+                        # keeps trying to run the query, but if invaid will cause an error
+                        results = st.session_state.chain.invoke({"query": curr_query , "schema": schema,
+                                                                "cypher_examples": st.session_state.cypher_examples_str})
+                        
+                        #print("here are the results of the model")
+                        #print(results)
+                        cypher_query = results['intermediate_steps'][0]['query']
+                        with output_block.container(border=True):
+                            cypher_code, result_table = st.columns(2)
+                            if contains_edit_keywords(cypher_query):
+                                cypher_query = "Edit keywords detected in Cypher query! Query will not be executed."
+                                #st.sidebar.warning("Edit keywords detected in Cypher query! Query will not be executed.")
+                                with cypher_code:
+                                    st.write("Your query contains database editing commands and will not be run.")
+                                print("Blocked query due to edit keywords:", cypher_query)
+                                result_list = ["Unable to process this input request"]
                             else:
-                                st.write("I was able to generate a valid cypher query")
-                                st.write("However, I was not able to find any results that matched your question")
-                    except Exception as e:
-                        display_error_line(e)
-                        st.write("Unfortunately the generated cypher query is not valid and I am not able to use it to answer your question")
-                end_timer = time.perf_counter()
-                st.write(f"Your question took {end_timer - start_timer:.2f} seconds to process \n")
-        except Exception as e:
-            display_error_line(e)
-            # st.write("Exception:", e)
-            st.write("I was unable to generate a valid cyper query based on your question")
-            st.write("Please check for spelling or filtering criteria to ensure the question was asked correctly")
-        # Ask if user wants to continue
-        if st.button("Ask Another Question", on_click=disable, args=(False,)):
-            #if user wants another question then enable input text and submit button
-            st.session_state.user_input = ""  # Clear input for next question
-            st.session_state.repeat_loop = True
-    if st.button("End Session" , on_click=disable, args=(True,)):
-        #user ended program, disable all buttons and inputs
-        #print("Failed to click the button")
-        st.session_state.repeat_loop = False
-if st.session_state.repeat_loop == False:
-    st.write("Thank you for using my program, hopefully I was able to answer all your questions")
-    st.write("Goodbye...")
-    st.stop()
-    #print("thank you for using my program, hopefully I was able to answer all your questions")
-    #print("Goodbye...")
+                                cypher_query = correct_cypher(cypher_query)
+                                wrapped_query = smart_wrap_code(cypher_query)
+                                with cypher_code:
+                                    st.markdown("<h3 style='font-size: 16px; color: black;'>Generated Cypher Query</h3>", unsafe_allow_html=True)
+                                    st.code(wrapped_query)
+                                try:
+                                    #print("Raw results:", results)
+                                    with st.session_state.driver.session() as session:
+                                        print("here is the cypher:")
+                                        print(cypher_query)
+
+                                        records = session.execute_read(get_query_data, cypher_query)
+                                        result_df = pd.DataFrame(records)
+                                        result_df.drop_duplicates(inplace=True)
+                                        result_list = [result_df]
+                                        #update_side_bar(curr_query, cypher_query, [result_df])
+                                        with result_table:
+                                            if len(result_df) > 0:
+                                                #st.header("Results: ")
+                                                st.markdown("<h3 style='font-size: 16px; color: black;'>Query Results</h3>", unsafe_allow_html=True)
+                                                st.write(result_df)
+                                            else:
+                                                st.markdown("<h3 style='font-size: 16px; color: black;'>Query Results</h3>", unsafe_allow_html=True)
+                                                st.write("I was able to generate a valid cypher query")
+                                                st.write("However, I was not able to find any results that matched your question")
+                                except Exception as e:
+                                    #display_error_line(e)
+                                    with result_table:
+                                        st.markdown("<h3 style='font-size: 16px; color: black;'>Query Results</h3>", unsafe_allow_html=True)
+                                        st.write("Unfortunately the generated cypher query is not valid and I am not able to use it to answer your question")
+                                    result_list = ["Generated query is invalid and not able to be run"]
+                                    #update_side_bar(curr_query, "Unable to generate a valid cypher statment", ["Query was not run"])
+
+                            end_timer = time.perf_counter()
+                            update_side_bar(curr_query, cypher_query, result_list)
+                            st.write(f"Your question took {end_timer - start_timer:.2f} seconds to process \n")
+                            toggle_another(False)
+                except Exception as e:
+                    print("")
+                    print(f"an error was found: {e}")
+                    #display_error_line(e)
+                    # st.write("Exception:", e)
+                    #st.write("I was unable to generate a valid cyper query based on your question")
+                    #st.write("Please check for spelling or filtering criteria to ensure the question was asked correctly")
+                # Ask if user wants to continue
+        with col_2:
+                ask_another()
+        with col_3:
+            if st.button("End Session     " , key= "end_program",  on_click=disable, args=(True, True)):
+                #user ended program, disable all buttons and inputs
+                #print("Failed to click the button")
+                st.session_state.repeat_loop = False
+    if "result_history" in st.session_state.result_history:
+        for curr_idx in st.session_state.result_history.index:  
+            input_question = st.session_state.result_history.loc[curr_idx, "Query"]
+            output_cypher = st.session_state.result_history.loc[curr_idx, "Cypher"]
+            output_results = st.session_state.result_history.loc[curr_idx, "Results"]
+            if(st.sidebar.button(input_question,  key= "question_" + str(curr_idx))):
+                print(f"question_{curr_idx} was pushed from loop")
+                with output_block.container(border=True):
+                    cypher_code, result_table = st.columns(2)
+                    with cypher_code:
+                        st.markdown("<h3 style='font-size: 16px; color: black;'>Generated Cypher Query</h3>", unsafe_allow_html=True)
+                        st.code(output_cypher)
+
+                    with result_table:
+                        st.markdown("<h3 style='font-size: 16px; color: black;'>Query Results</h3>", unsafe_allow_html=True)
+                        st.write(output_results)
+
+    if st.session_state.repeat_loop == False:
+        st.write("Thank you for using my program, hopefully I was able to answer all your questions")
+        st.write("Goodbye...")
+        st.stop()
+        #print("thank you for using my program, hopefully I was able to answer all your questions")
+        #print("Goodbye...")
