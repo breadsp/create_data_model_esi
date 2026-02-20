@@ -50,6 +50,7 @@ print("Connected to Memgraph")
 ## get the toolkits from memgraph that will be used
 toolkit = MemgraphToolkit(db=db, llm=model)
 tools = toolkit.get_tools()
+tools = [tool for tool in tools if tool.name not in ["run_cypher"]]
 
 tool_names = [tool.name for tool in tools]
 print(f"Available tools: {[tool.name for tool in tools]}")
@@ -64,6 +65,8 @@ template = '''Answer the following questions as best you can. You have access to
 Use the following format:
     
 Information:  Do not use GROUP BY in the final cypher statment
+Participant age is stored as age_at_enrollment
+Cancer Type is stored in primary_disease_site
 
 Question: the input question you must answer
 Thought: you should always think about what to do
@@ -85,11 +88,10 @@ prompt = PromptTemplate.from_template(template)
 agent = create_react_agent(model, tools, prompt) # Using ReAct pattern
 
 agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True,
-                               return_intermediate_steps=False, tool_choice="auto")
+                               return_intermediate_steps=True, tool_choice="auto")
 
 # Invoke the agent
-user_query = "give me a racial breakdown of all participants, group resutls for each gender?"
-
+user_query = "participants with lung cancer, over the age of 50"
 try:
     response = agent_executor.invoke({"input": user_query, "tools": tools, "agent_scratchpad": list_of_tools,
                                       "system": "Pull the schema first to ensure you know what the nodes are and where properties are stored"})
