@@ -15,7 +15,7 @@ from langchain_anthropic import ChatAnthropic
 
 # Initialize Anthropic client
 #ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-ANTHROPIC_API_KEY = "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"
+ANTHROPIC_API_KEY = "put your API key here"
 model = ChatAnthropic(model="claude-haiku-4-5-20251001", api_key=ANTHROPIC_API_KEY )
 
 
@@ -179,3 +179,4 @@ if st.session_state.mem_db:
 
 else:
     st.info("Waiting for Memgraph connection. Please ensure Memgraph is running.")
+
