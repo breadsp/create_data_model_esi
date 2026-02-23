@@ -166,7 +166,8 @@ with st.expander("💡 Example Queries"):
     st.markdown("""
     - `What is the total count of participants in the database?`
     - `Show me participants with lung cancer`
-    - `Give me a breakdown of participants by gender`
+    - `Give me a breakdown of participants by sex`
+    - `Give me the information on participant MOCK-SUBJECT-22034`
     - `What studies are in the database?`
     """)
 
@@ -237,7 +238,4 @@ with st.sidebar:
     - Host: localhost:7687
     - Status: 🟢 Connected
     
-    **Database Schema:**
-    - Participant age: `age_at_enrollment`
-    - Cancer Type: `primary_disease_site`
     """)
