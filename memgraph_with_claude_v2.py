@@ -7,6 +7,7 @@ Created on Fri Feb 20 09:12:54 2026
 import streamlit as st
 import mgclient
 import threading
+import json
 from langchain_anthropic import ChatAnthropic
 from langchain_memgraph.toolkits import MemgraphToolkit
 from langchain_memgraph.graphs.memgraph import MemgraphLangChain
@@ -49,16 +50,22 @@ def initialize_memgraph_agent():
             if result["error"]:
                 raise result["error"]
 
-        # Initialize Claude
+        # Initialize Claude models
         status.update(label="Initializing Claude...")
-        log_step("1) Initializing Claude client")
-        model = ChatAnthropic(model="claude-sonnet-4-5-20250929", api_key=ANTHROPIC_API_KEY)
+        log_step("1) Initializing Claude clients")
+        model_ids = [
+            "claude-haiku-4-5-20251001",
+            "claude-3-5-haiku-20241022",
+            "claude-3-haiku-20240307",
+        ]
+        models = [ChatAnthropic(model=model_id, api_key=ANTHROPIC_API_KEY) for model_id in model_ids]
 
         # Verify Claude connection (short timeout)
         status.update(label="Verifying Claude connection...")
-        log_step("2) Verifying Claude connection")
-        run_with_timeout("Claude check", lambda: model.invoke("Ping"), 30)
-        log_step("   Claude check passed")
+        log_step("2) Verifying Claude connections")
+        for model_id, model in zip(model_ids, models):
+            run_with_timeout(f"Claude check ({model_id})", lambda m=model: m.invoke("Ping"), 30)
+        log_step("   Claude checks passed")
 
         # Connect to Memgraph
         status.update(label="Connecting to Memgraph...")
@@ -81,7 +88,7 @@ def initialize_memgraph_agent():
         # Get toolkit
         status.update(label="Loading toolkit (this may take a moment)...")
         log_step("5) Loading Memgraph toolkit")
-        toolkit = MemgraphToolkit(db=db, llm=model)
+        toolkit = MemgraphToolkit(db=db, llm=models[0])
 
         @tool
         def show_schema_info_local():
@@ -89,31 +96,44 @@ def initialize_memgraph_agent():
             schema_info = db.query("SHOW SCHEMA INFO")
             return schema_info
 
+        @tool
+        def run_cypher(query: str):
+            """Run a Cypher query against Memgraph."""
+            return db.query(query)
+
+        @tool
+        def run_query(query: str):
+            """Run a Cypher query against Memgraph (alias)."""
+            return db.query(query)
+
         tools = toolkit.get_tools()
-        tools = [tool for tool in tools if tool.name not in ["show_schema_info"]]
-        tools.append(show_schema_info_local)
+        tools = [tool for tool in tools if tool.name not in ["show_schema_info", "run_cypher", "run_query"]]
+        tools.extend([show_schema_info_local, run_cypher, run_query])
         log_step(f"   Loaded {len(tools)} tools")
         
         tool_names = [tool.name for tool in tools]
         list_of_tools = ', '.join(tool_names)
         
         # Create prompt template
-        template = '''Answer the following questions as best you can. You have access to the following tools:
+        template = '''You are an expert at translating user questions into Cypher. You have access to the following tools:
 
 {tools}
 
 Use the following format:
     
-Information:  Do not use GROUP BY in the final cypher statement
+Information: Do not use GROUP BY in the final cypher statement
 Participant age is stored as age_at_enrollment
 Cancer Type is stored in primary_disease_site
+Always call show_schema_info_local before writing Cypher.
+Node labels are case-sensitive and MUST match the schema exactly.
+Iterate up to 10 times: propose a Cypher query, run it, evaluate the result against the schema and the user question, then refine. Use the best final query.
 
 
 Question: the input question you must answer
-Thought: you should always think about what to do
+Thought: determine which schema elements are needed
 Action: the action to take, should be one of [{tool_names}]
 Action Input: the input to the action
-Observation: the result of the action, Always consult the schema by using show_schema_info_local when constructing a cypher query and also all node names should be lowercase, Do not use GROUP BY in the final cypher statement.
+Observation: the result of the action. Evaluate whether the query matches the schema and answers the question.
 ... (this Thought/Action/Action Input/Observation can repeat N times)
 Thought: I now know the final answer
 Final Answer: the final answer to the original input question
@@ -126,23 +146,28 @@ Question: {input}
 Thought:{agent_scratchpad}'''
         
         prompt = PromptTemplate.from_template(template)
-        agent = create_react_agent(model, tools, prompt)
-        
-        agent_executor = AgentExecutor(
-            agent=agent, 
-            tools=tools, 
-            verbose=True, 
-            handle_parsing_errors=True,
-            return_intermediate_steps=True, 
-            tool_choice="auto",
-            max_iterations=5
-        )
+        executors = []
+        for model in models:
+            agent = create_react_agent(model, tools, prompt)
+            executors.append(
+                AgentExecutor(
+                    agent=agent,
+                    tools=tools,
+                    verbose=True,
+                    handle_parsing_errors=True,
+                    return_intermediate_steps=True,
+                    tool_choice="auto",
+                    max_iterations=12,
+                )
+            )
         
         status.update(label="Ready!", state="complete")
         log_step("6) Initialization complete")
         return {
-            "executor": agent_executor,
-            "tool_names": tool_names
+            "executors": executors,
+            "tool_names": tool_names,
+            "model": models[-1],
+            "model_ids": model_ids
         }
         
     except Exception as e:
@@ -164,10 +189,11 @@ st.divider()
 # Example queries
 with st.expander("💡 Example Queries"):
     st.markdown("""
-    - `What is the total count of participants in the database?`
-    - `Show me participants with lung cancer`
-    - `Give me a breakdown of participants by gender`
-    - `What studies are in the database?`
+    - `How many nodes are in the database?`
+    - `Show me all nodes and their relationships`
+    - `What are the different node types?`
+    - `Give me a summary of the database structure`
+    - `List all nodes of a specific type and their properties`
     """)
 
 # User input
@@ -193,15 +219,62 @@ if submit_button and user_query:
     st.subheader("📊 Query Results")
     
     try:
-        with st.spinner("🤔 Claude is thinking..."):
-            response = agent_data["executor"].invoke({
-                "input": user_query
-            })
+        with st.spinner("🤔 Claude is thinking (3 models)..."):
+            responses = []
+            for executor in agent_data["executors"]:
+                responses.append(
+                    executor.invoke({
+                        "input": user_query
+                    })
+                )
+
+        def summarize_candidate(resp):
+            steps = resp.get("intermediate_steps", [])
+            last_cypher = ""
+            for action, _ in steps:
+                if action.tool in ["run_cypher", "run_query"]:
+                    last_cypher = str(action.tool_input)
+            return {
+                "output": resp.get("output", ""),
+                "last_cypher": last_cypher,
+                "steps": len(steps)
+            }
+
+        candidates = [summarize_candidate(r) for r in responses]
+
+        judge_prompt = (
+            "You are grading 3 candidate answers to a graph database question. "
+            "Pick the best one based on: schema compliance (case-sensitive labels), "
+            "query correctness, and completeness. "
+            "Return JSON only with keys: best_index (1-3) and reason.\n\n"
+            f"User question: {user_query}\n\n"
+            f"Candidate 1: {json.dumps(candidates[0], ensure_ascii=True)}\n"
+            f"Candidate 2: {json.dumps(candidates[1], ensure_ascii=True)}\n"
+            f"Candidate 3: {json.dumps(candidates[2], ensure_ascii=True)}\n"
+        )
+
+        best_index = 1
+        judge_reason = ""
+        try:
+            judge_reply = agent_data["model"].invoke(judge_prompt)
+            judge_text = judge_reply.content if hasattr(judge_reply, "content") else str(judge_reply)
+            judge_data = json.loads(judge_text)
+            best_index = int(judge_data.get("best_index", 1))
+            judge_reason = str(judge_data.get("reason", ""))
+        except Exception:
+            best_index = 1
+
+        best_index = max(1, min(3, best_index))
+        response = responses[best_index - 1]
         
         st.success("✅ Query completed!")
         
+        if judge_reason:
+            model_label = agent_data.get("model_ids", ["model"] * 3)[best_index - 1]
+            st.info(f"Selected model {best_index} ({model_label}) as best: {judge_reason}")
+
         # Tabs for results
-        tab1, tab2, tab3 = st.tabs(["📝 Answer", "🔍 Steps", "📋 Raw"])
+        tab1, tab2, tab3, tab4 = st.tabs(["📝 Answer", "🔍 Steps", "📋 Raw", "🧪 Candidates"])
         
         with tab1:
             st.markdown("### Final Answer")
@@ -222,6 +295,18 @@ if submit_button and user_query:
         
         with tab3:
             st.json(response)
+
+        with tab4:
+            st.markdown("### Candidate Responses")
+            for idx, resp in enumerate(responses, 1):
+                model_label = agent_data.get("model_ids", ["model"] * 3)[idx - 1]
+                with st.expander(f"Candidate {idx} ({model_label})"):
+                    st.write(resp.get("output", "(no output)"))
+                    st.json({
+                        "last_cypher": candidates[idx - 1]["last_cypher"],
+                        "steps": candidates[idx - 1]["steps"],
+                        "raw": resp
+                    })
     
     except Exception as ex:
         st.error(f"❌ Error: {str(ex)}")
@@ -231,13 +316,18 @@ elif submit_button and not user_query:
 
 # Sidebar
 with st.sidebar:
-    st.header("ℹ️ Info")
+    st.header("ℹ️ Database Info")
     st.markdown("""
     **Connection:**
     - Host: localhost:7687
     - Status: 🟢 Connected
     
-    **Database Schema:**
-    - Participant age: `age_at_enrollment`
-    - Cancer Type: `primary_disease_site`
+    **How It Works:**
+    1. Ask a natural language question
+    2. Claude uses available tools to discover the database schema
+    3. Claude constructs a schema-aware Cypher query
+    4. Results are returned as a formatted table
+    
+    **Available Tools:**
+    The agent has access to Memgraph tools for schema discovery and query execution. Schema information is discovered dynamically, not hardcoded.
     """)
