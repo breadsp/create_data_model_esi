@@ -12,6 +12,7 @@ from langchain_memgraph.toolkits import MemgraphToolkit
 from langchain_memgraph.graphs.memgraph import MemgraphLangChain
 from langchain_classic.agents import AgentExecutor, create_react_agent
 from langchain_core.prompts import PromptTemplate
+from langchain.tools import tool
 
 # Streamlit Page Configuration
 st.set_page_config(page_title="Memgraph AI Query Interface", page_icon="🧠", layout="wide")
@@ -51,12 +52,12 @@ def initialize_memgraph_agent():
         # Initialize Claude
         status.update(label="Initializing Claude...")
         log_step("1) Initializing Claude client")
-        model = ChatAnthropic(model="claude-haiku-4-5-20251001", api_key=ANTHROPIC_API_KEY)
+        model = ChatAnthropic(model="claude-sonnet-4-5-20250929", api_key=ANTHROPIC_API_KEY)
 
         # Verify Claude connection (short timeout)
         status.update(label="Verifying Claude connection...")
         log_step("2) Verifying Claude connection")
-        run_with_timeout("Claude check", lambda: model.invoke("Ping"), 8)
+        run_with_timeout("Claude check", lambda: model.invoke("Ping"), 30)
         log_step("   Claude check passed")
 
         # Connect to Memgraph
@@ -81,8 +82,16 @@ def initialize_memgraph_agent():
         status.update(label="Loading toolkit (this may take a moment)...")
         log_step("5) Loading Memgraph toolkit")
         toolkit = MemgraphToolkit(db=db, llm=model)
+
+        @tool
+        def show_schema_info_local():
+            """Tool for showing schema information from Memgraph."""
+            schema_info = db.query("SHOW SCHEMA INFO")
+            return schema_info
+
         tools = toolkit.get_tools()
         tools = [tool for tool in tools if tool.name not in ["show_schema_info"]]
+        tools.append(show_schema_info_local)
         log_step(f"   Loaded {len(tools)} tools")
         
         tool_names = [tool.name for tool in tools]
@@ -104,7 +113,7 @@ Question: the input question you must answer
 Thought: you should always think about what to do
 Action: the action to take, should be one of [{tool_names}]
 Action Input: the input to the action
-Observation: the result of the action
+Observation: the result of the action, Always consult the schema by using show_schema_info_local when constructing a cypher query and also all node names should be lowercase, Do not use GROUP BY in the final cypher statement.
 ... (this Thought/Action/Action Input/Observation can repeat N times)
 Thought: I now know the final answer
 Final Answer: the final answer to the original input question
