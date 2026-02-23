@@ -1,0 +1,8 @@
+streamlit
+pandas
+pymgclient
+streamlit-agraph
+langchain-core
+langchain-community
+langchain-ollama
+tabulate

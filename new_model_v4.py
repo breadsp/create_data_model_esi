@@ -11,7 +11,7 @@ import time
 from tabulate import tabulate
 
 # load the training data which will be passed to the template
-train_df = pd.read_excel(r"C:\Users\breadsp2\Desktop\olloma testing\sample_queries.xlsx")
+train_df = pd.read_excel("sample_queries.xlsx")
 
 def create_examples_string(examples):
     examples_str = ""
