@@ -1,0 +1,9 @@
+tabulate
+pandas
+openpyxl
+langchain-core
+langchain_community
+langchain_neo4j
+streamlit
+streamlit_chat
+streamlit_chatbox
