@@ -8,6 +8,8 @@ Created on Thu Jan 29 10:42:59 2026
 import streamlit as st
 import pandas as pd
 import mgclient
+import re
+
 from streamlit_agraph import agraph, Node, Edge, Config
 from langchain_anthropic import ChatAnthropic
 
@@ -92,7 +94,7 @@ if "mem_db" not in st.session_state:
 def get_mem_tools(db):
     toolkit = MemgraphToolkit(db=db, llm=model)
     tools = toolkit.get_tools()
-    tools = [tool for tool in tools if tool.name not in ["run_cypher"]]
+    #tools = [tool for tool in tools if tool.name not in ["run_cypher"]]
     
     return tools
 
@@ -198,7 +200,10 @@ def get_graph_data():
 
 def make_schema(node_df, edge_df):
     nodes_agraph = [Node(id=node_df.loc[node, "index"], label=node_df.loc[node, "label"], 
-                      size=25, shape="dot") for node in node_df.index]
+                      size=25, shape="dot", color = node_df.loc[node, "color"]) for node in node_df.index]
+# color="#FF0000")) # Red
+# color="#00FF00")) # Green
+    
     edges_agraph = [Edge(source=edge_df.loc[edge, 'index_x'], target=edge_df.loc[edge, 'index_y'], 
                      label="") for edge in edge_df.index]
                      #label=final_df_edge.loc[edge, 'label']) for edge in final_df_edge.index]
@@ -214,6 +219,9 @@ def make_schema(node_df, edge_df):
 #    with graph_window.container(border=True):
     return nodes_agraph, edges_agraph, config
 
+if "cypher_str" not in st.session_state:
+    st.session_state.cypher_str = ""
+
 if "graph_data" not in st.session_state:
     st.session_state.graph_data = get_graph_data()
     z = pd.DataFrame(st.session_state.graph_data["nodes"])
@@ -223,22 +231,24 @@ if "graph_data" not in st.session_state:
     for idx in range(0,len(res)):
         st.session_state.graph_data["nodes"][idx]["index"] = res[idx]
   
+if "node_df" not in st.session_state and "final_df_edge" not in st.session_state:
+    st.session_state.node_df = pd.DataFrame(st.session_state.graph_data["nodes"])
+    edge_df = pd.DataFrame(st.session_state.graph_data["edges"])
 
-edge_df = pd.DataFrame(st.session_state.graph_data["edges"])
-node_df = pd.DataFrame(st.session_state.graph_data["nodes"])
-new_edges = edge_df.merge(node_df[["id","index"]], left_on="source", right_on="id")
-new_edges = new_edges.merge(node_df[["id","index"]], left_on="target", right_on="id")
-
-node_df.drop_duplicates("index", inplace=True)
-final_df_edge = new_edges.drop_duplicates(["index_x", "index_y"])
-
-node_df.drop("id", axis=1, inplace=True)
-final_df_edge.drop(["source", "target"], axis=1, inplace=True)
-
-final_df_edge["index_x"] = final_df_edge["index_x"].astype(str)
-final_df_edge["index_y"] = final_df_edge["index_y"].astype(str)
-node_df["index"] = node_df["index"].astype(str)
-node_df.reset_index(inplace=True)
+    new_edges = edge_df.merge(st.session_state.node_df[["id","index"]], left_on="source", right_on="id")
+    new_edges = new_edges.merge(st.session_state.node_df[["id","index"]], left_on="target", right_on="id")
+    
+    st.session_state.node_df.drop_duplicates("index", inplace=True)
+    st.session_state.final_df_edge = new_edges.drop_duplicates(["index_x", "index_y"])
+    
+    st.session_state.node_df.drop("id", axis=1, inplace=True)
+    st.session_state.final_df_edge.drop(["source", "target"], axis=1, inplace=True)
+    
+    st.session_state.final_df_edge["index_x"] = st.session_state.final_df_edge["index_x"].astype(str)
+    st.session_state.final_df_edge["index_y"] = st.session_state.final_df_edge["index_y"].astype(str)
+    st.session_state.node_df["index"] = st.session_state.node_df["index"].astype(str)
+    st.session_state.node_df["color"] = "#87CEFA"   #blue nodes
+    st.session_state.node_df.reset_index(inplace=True)
 
     
 st.markdown("""
@@ -265,14 +275,14 @@ with schema_col:
     show_schema, schema_table = st.tabs(["Visualize Schema", "Schema as Table"])
             
     with show_schema:
-        nodes_agraph, edges_agraph, config = make_schema(node_df, final_df_edge)
+        nodes_agraph, edges_agraph, config = make_schema(st.session_state.node_df, st.session_state.final_df_edge)
         agraph(nodes_agraph, edges_agraph, config)
 
     with schema_table:
-        st.dataframe(final_df_edge[["child", "label", "parent"]])
+        st.dataframe(st.session_state.final_df_edge[["child", "label", "parent"]])
 
 with user_col:
-    user_input, user_output = st.tabs(["User Query", "Summary"])
+    user_input, cypher_output, result_table, user_output = st.tabs(["User Query", "Cypher Code", "Result Table", "Summary"])
     
     with user_input:
         user_query = st.text_area(
@@ -291,13 +301,6 @@ with user_col:
         if clear_button:
             st.rerun()
             
-    with user_output:
-        st.write("here is the output")
-       # st.write(f"the response file is : {st.session_state.response}")
-        for curr_key in st.session_state.response:
-            if curr_key == "output":
-                st.write(st.session_state.response[curr_key])
-                      
     if submit_button and user_query:
         st.divider()
         error_count = 0
@@ -311,5 +314,58 @@ with user_col:
             st.success("✅ Query completed!")
             #st.write(st.session_state.response["output"])
             
+            if "output" in st.session_state.response:
+                output_str = st.session_state.response["output"]
+                st.session_state.cypher_str = output_str[output_str.find("```"):output_str.find("```\n")]
+
         except Exception:
             st.error("❌ Query failed!")
+        finally:
+            st.rerun()
+            
+    
+    with cypher_output:
+
+        if st.session_state.cypher_str != "":
+            print(st.session_state.response["output"]) 
+            st.write(st.session_state.cypher_str)
+         #   print(st.session_state.response[curr_key])
+                
+            pattern = r"([a-z]{1}:[a-z]+)"
+            matches = re.findall(pattern, st.session_state.cypher_str)
+            node_names = [i[2:] for i in matches]
+            
+            x = st.session_state.node_df.query(f"label in {node_names}")
+            st.session_state.node_df.loc[x.index, "color"] = "#00FF00"
+        else:
+            st.write("no cypher statement was created")
+                
+    with result_table:
+        if st.session_state.cypher_str != "":
+        #    print("here is the cypher\n")
+            query = st.session_state.cypher_str.replace("```cypher","")
+            query = query.replace("```","")
+            query = query.replace("``","")
+         #   print(query)
+            
+            st.session_state.mem_db.cursor.execute(query)
+            result = st.session_state.mem_db.cursor.fetchall()
+            columns = [desc.name for desc in st.session_state.mem_db.cursor.description]
+            df = pd.DataFrame(result, columns=columns)
+            st.dataframe(df)
+        else:
+            st.write("no data to display")    
+        
+            
+    with user_output:
+        st.write("here is the output")
+       # st.write(f"the response file is : {st.session_state.response}")
+        for curr_key in st.session_state.response:
+            if curr_key == "output":
+                output_str = st.session_state.response[curr_key]
+                display_str = output_str[(output_str.find("```\n\n")+5):]
+                st.write(display_str)
+              #  print(st.session_state.response[curr_key])
+                
+            
+                      
