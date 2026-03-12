@@ -10,6 +10,7 @@ import pandas as pd
 import mgclient as mgclient
 import re
 import os
+import json
 import httpx
 
 from streamlit_agraph import agraph, Node, Edge, Config
@@ -65,20 +66,32 @@ st.markdown("<h1 class='no-space' style='text-align: center; color: black; font-
 
 # xAI API configuration
 AIX_API_BASE_URL =  "https://api.x.ai/v1"
-AIX_MODEL = "grok-4.20-beta-0309-reasoning"
+AIX_MODELS = [
+    m.strip() for m in os.getenv(
+        "AIX_MODELS",
+        "grok-4.20-beta-0309-reasoning,grok-4-fast,grok-3-mini-fast"
+    ).split(",") if m.strip()
+]
+AIX_JUDGE_MODEL = os.getenv("AIX_JUDGE_MODEL", "grok-4.20-beta-0309-reasoning")
 AIX_INSECURE_SSL = os.getenv("AIX_INSECURE_SSL", "false").lower() == "true"
 
 if not AIX_API_KEY:
     st.error("Missing AIX_API_KEY environment variable.")
     st.stop()
 
-model = ChatOpenAI(
-    model=AIX_MODEL,
-    api_key=AIX_API_KEY,
-    base_url=AIX_API_BASE_URL,
-    temperature=0,
-    http_client=httpx.Client(verify=not AIX_INSECURE_SSL),
-)
+if len(AIX_MODELS) < 1:
+    st.error("No xAI generation models configured. Set AIX_MODELS.")
+    st.stop()
+
+
+def build_chat_model(model_name):
+    return ChatOpenAI(
+        model=model_name,
+        api_key=AIX_API_KEY,
+        base_url=AIX_API_BASE_URL,
+        temperature=0,
+        http_client=httpx.Client(verify=not AIX_INSECURE_SSL),
+    )
 
 class Memgraph_DB():
     def __init__(self):
@@ -118,7 +131,7 @@ if "db" not in st.session_state:
     )
 
 def get_mem_tools(db):
-    toolkit = MemgraphToolkit(db=db, llm=model)
+    toolkit = MemgraphToolkit(db=db, llm=build_chat_model(AIX_MODELS[0]))
     tools = toolkit.get_tools()
     # Keep only run_cypher to avoid no-input tool signature issues with some model/agent combos.
     tools = [tool for tool in tools if tool.name == "run_cypher"]
@@ -160,8 +173,23 @@ if "last_summary_query" not in st.session_state:
 if "last_user_query" not in st.session_state:
     st.session_state.last_user_query = ""
 
-def create_agent(tools, model):
-    template = '''You are an expert Cypher data specialist who can generate complex queries based on user requirements to answer their questions.Answer the following questions as best you can in the form of a Cypher query. You have access to the following tools:
+if "generation_models" not in st.session_state:
+    st.session_state.generation_models = AIX_MODELS[:3]
+
+if "judge_model_name" not in st.session_state:
+    st.session_state.judge_model_name = AIX_JUDGE_MODEL
+
+if "agent_executors" not in st.session_state:
+    st.session_state.agent_executors = {}
+
+if "model_runs" not in st.session_state:
+    st.session_state.model_runs = {}
+
+if "judge_decision" not in st.session_state:
+    st.session_state.judge_decision = {}
+
+def create_agent(tools, llm):
+    template = '''You are an expert Open-Cypher data specialist who can generate complex queries based on user requirements to answer their questions using Open-Cypher.Answer the following questions as best you can in the form of a Cypher query. You have access to the following tools:
     
     {tools}
     
@@ -170,7 +198,10 @@ def create_agent(tools, model):
     Information:  Do not use GROUP BY in the final cypher statment
     Participant age is stored as age_at_enrollment
     Cancer Type is stored in primary_disease_site
-    Participant_id is stored in the participant node
+    participant_id is stored in the participant node
+    All nodes are lowercase and all relationships are lowercase
+    Never use gender only use demographic.sex
+    Don't use directional relationships in the cypher, the direction does not matter and can cause confusion for the model
     
     Cypher Rules:
         when the variable is not a number then use the following filtering format WHERE ANY(term IN [term] WHERE tolower(variable) CONTAINS term) 
@@ -196,17 +227,156 @@ def create_agent(tools, model):
     
     # xAI grok models can reject the OpenAI-style `stop` parameter; disable stop sequence injection.
     try:
-        agent = create_react_agent(model, tools, prompt, stop_sequence=False)  # Using ReAct pattern
+        agent = create_react_agent(llm, tools, prompt, stop_sequence=False)  # Using ReAct pattern
     except TypeError:
         # Fallback for older langchain versions that don't expose stop_sequence.
-        agent = create_react_agent(model, tools, prompt)
+        agent = create_react_agent(llm, tools, prompt)
     
     agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=False, handle_parsing_errors=True,
                                    return_intermediate_steps=False, tool_choice="auto")
     return agent_executor
-    
-if "agent_executor" not in st.session_state:
-    st.session_state.agent_executor = create_agent(st.session_state.tools, model)
+
+
+def get_or_create_agent_executor(model_name):
+    if model_name not in st.session_state.agent_executors:
+        llm = build_chat_model(model_name)
+        st.session_state.agent_executors[model_name] = create_agent(st.session_state.tools, llm)
+    return st.session_state.agent_executors[model_name]
+
+
+def run_generation_models(user_query):
+    runs = {}
+    for model_name in st.session_state.generation_models:
+        try:
+            executor = get_or_create_agent_executor(model_name)
+            response = executor.invoke({"input": user_query})
+            output_str = response.get("output", "") if isinstance(response, dict) else str(response)
+            runs[model_name] = {
+                "status": "ok",
+                "response": response,
+                "output": output_str,
+                "cypher": extract_cypher(output_str),
+                "error": "",
+            }
+        except Exception as e:
+            error_text = str(e)
+            runs[model_name] = {
+                "status": "error",
+                "response": {},
+                "output": "",
+                "cypher": extract_cypher(error_text),
+                "error": error_text,
+            }
+    return runs
+
+
+def judge_best_cypher(user_query, model_runs):
+    candidates = []
+    for model_name, run_data in model_runs.items():
+        if run_data.get("cypher"):
+            candidates.append({"model": model_name, "cypher": run_data["cypher"]})
+
+    if not candidates:
+        return {
+            "selected_model": "",
+            "selected_cypher": "",
+            "reason": "No model produced a Cypher query.",
+        }
+
+    if len(candidates) == 1:
+        return {
+            "selected_model": candidates[0]["model"],
+            "selected_cypher": candidates[0]["cypher"],
+            "reason": "Only one model produced Cypher.",
+        }
+
+    judge_prompt = f"""
+You are a Cypher judge. Choose the best query for the user's question.
+
+Question:
+{user_query}
+
+Candidates:
+{json.dumps(candidates, indent=2)}
+
+Return strict JSON only with keys: selected_model, selected_cypher, reason.
+"""
+
+    try:
+        judge_model = build_chat_model(st.session_state.judge_model_name)
+        judge_resp = judge_model.invoke(judge_prompt)
+        judge_text = judge_resp.content if hasattr(judge_resp, "content") else str(judge_resp)
+        json_match = re.search(r"\{[\s\S]*\}", judge_text)
+        if not json_match:
+            raise ValueError("Judge output was not valid JSON.")
+        parsed = json.loads(json_match.group(0))
+        return {
+            "selected_model": parsed.get("selected_model", ""),
+            "selected_cypher": parsed.get("selected_cypher", ""),
+            "reason": parsed.get("reason", "Judge provided no reason."),
+        }
+    except Exception as e:
+        return {
+            "selected_model": candidates[0]["model"],
+            "selected_cypher": candidates[0]["cypher"],
+            "reason": f"Judge fallback used: {e}",
+        }
+
+
+def validate_cypher_against_schema(cypher, user_query):
+    """Ask the judge model to verify the selected Cypher against the known schema and fix any mismatches."""
+    if not cypher:
+        return cypher, "No Cypher to validate."
+
+    # Build schema description from session state
+    schema_lines = []
+    try:
+        edge_df = st.session_state.final_df_edge
+        if not edge_df.empty and {"child", "label", "parent"}.issubset(edge_df.columns):
+            for _, row in edge_df[["child", "label", "parent"]].drop_duplicates().iterrows():
+                schema_lines.append(f"  ({row['child']})-[:{row['label']}]->({row['parent']})")
+    except Exception:
+        pass
+
+    schema_text = "\n".join(schema_lines) if schema_lines else "Schema unavailable."
+
+    validation_prompt = f"""You are a Cypher validator for a graph database.
+
+User question:
+{user_query}
+
+Known graph schema (node labels and relationship types):
+{schema_text}
+
+Cypher to validate:
+{cypher}
+
+Instructions:
+1. Check that every node label used in the Cypher appears in the schema.
+2. Check that every relationship type used in the Cypher appears in the schema.
+3. If the Cypher is already correct for the schema, return it unchanged.
+4. If there are label or relationship mismatches, fix them using the closest valid schema element.
+5. Do not change query logic, only fix label/relationship names that deviate from the schema.
+
+Return strict JSON only — no markdown, no extra text — with these keys:
+- is_valid: boolean
+- corrected_cypher: the corrected (or original if valid) Cypher string
+- validation_notes: one-sentence description of issues found and corrections made, or "Query matches schema." if valid
+"""
+
+    try:
+        judge_model = build_chat_model(st.session_state.judge_model_name)
+        resp = judge_model.invoke(validation_prompt)
+        resp_text = resp.content if hasattr(resp, "content") else str(resp)
+        json_match = re.search(r"\{[\s\S]*\}", resp_text)
+        if not json_match:
+            raise ValueError("Validation output was not valid JSON.")
+        parsed = json.loads(json_match.group(0))
+        corrected = parsed.get("corrected_cypher", cypher).strip()
+        notes = parsed.get("validation_notes", "")
+        return corrected, notes
+    except Exception as e:
+        return cypher, f"Schema validation skipped: {e}"
 
 
 def summarize_result_table(df, user_question, cypher_query):
@@ -237,7 +407,8 @@ Do not output cypher.
 """
 
     try:
-        summary_resp = model.invoke(summary_prompt)
+        summary_model = build_chat_model(st.session_state.judge_model_name)
+        summary_resp = summary_model.invoke(summary_prompt)
         return summary_resp.content if hasattr(summary_resp, "content") else str(summary_resp)
     except Exception as e:
         return f"Unable to generate AI summary from result table: {e}"
@@ -408,19 +579,35 @@ with user_col:
         st.divider()
         st.session_state.cypher_str = ""
         st.session_state.response = {}
+        st.session_state.model_runs = {}
+        st.session_state.judge_decision = {}
         st.session_state.result_summary = ""
         st.session_state.last_summary_query = ""
         st.session_state.last_user_query = user_query
         try:
-            st.session_state.response = st.session_state.agent_executor.invoke({"input": user_query})
-            st.success("✅ Query completed!")
+            st.session_state.model_runs = run_generation_models(user_query)
+            st.session_state.judge_decision = judge_best_cypher(user_query, st.session_state.model_runs)
 
-            if "output" in st.session_state.response:
-                output_str = st.session_state.response["output"]
-                st.session_state.cypher_str = extract_cypher(output_str)
+            selected_cypher = st.session_state.judge_decision.get("selected_cypher", "")
 
-            if st.session_state.cypher_str == "":
-                st.warning("No Cypher block found in model output.")
+            # Schema validation pass — judge reviews its own selection against actual schema
+            if selected_cypher:
+                validated_cypher, validation_notes = validate_cypher_against_schema(selected_cypher, user_query)
+            else:
+                validated_cypher, validation_notes = "", "No Cypher to validate."
+
+            st.session_state.judge_decision["validated_cypher"] = validated_cypher
+            st.session_state.judge_decision["validation_notes"] = validation_notes
+            st.session_state.cypher_str = validated_cypher
+
+            selected_model = st.session_state.judge_decision.get("selected_model", "")
+            if selected_model and selected_model in st.session_state.model_runs:
+                st.session_state.response = st.session_state.model_runs[selected_model].get("response", {})
+
+            if st.session_state.cypher_str:
+                st.success("✅ Query generated, judge-selected, and schema-validated.")
+            else:
+                st.warning("No Cypher query was generated by the configured models.")
 
         except Exception as e:
             st.error(f"❌ Query failed: {e}")
@@ -449,6 +636,27 @@ with user_col:
                 
     with summary_tab:
         st.write("Summary")
+
+        if st.session_state.model_runs:
+            run_rows = []
+            for model_name, run_data in st.session_state.model_runs.items():
+                run_rows.append({
+                    "model": model_name,
+                    "status": run_data.get("status", ""),
+                    "has_cypher": bool(run_data.get("cypher")),
+                    "error": run_data.get("error", "")[:140],
+                })
+            st.write("Model generation runs")
+            st.dataframe(pd.DataFrame(run_rows), use_container_width=True)
+
+        if st.session_state.judge_decision:
+            with st.container(border=True):
+                st.write("Judge selection")
+                st.write(f"Selected model: {st.session_state.judge_decision.get('selected_model', 'n/a')}")
+                st.write(st.session_state.judge_decision.get("reason", ""))
+                validation_notes = st.session_state.judge_decision.get("validation_notes", "")
+                if validation_notes:
+                    st.write(f"Schema validation: {validation_notes}")
 
         if st.session_state.cypher_str != "":
             try:
