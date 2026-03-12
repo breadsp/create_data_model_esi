@@ -2,8 +2,14 @@ tabulate
 pandas
 openpyxl
 langchain-core
+langchain-openai
 langchain_community
 langchain_neo4j
+langchain-classic
+langchain-memgraph
+neo4j
+streamlit-agraph
+pymgclient
 streamlit
 streamlit_chat
 streamlit_chatbox
