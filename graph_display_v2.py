@@ -74,6 +74,7 @@ AIX_MODELS = [
 ]
 AIX_JUDGE_MODEL = os.getenv("AIX_JUDGE_MODEL", "grok-4.20-beta-0309-reasoning")
 AIX_INSECURE_SSL = os.getenv("AIX_INSECURE_SSL", "false").lower() == "true"
+AIX_API_KEY = st.secrets['AIX_API_KEY']
 
 if not AIX_API_KEY:
     st.error("Missing AIX_API_KEY environment variable.")
