@@ -12,6 +12,8 @@ import re
 import os
 import json
 import httpx
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from streamlit_agraph import agraph, Node, Edge, Config
 from langchain_openai import ChatOpenAI
@@ -310,29 +312,68 @@ def get_or_create_agent_executor(model_name):
 
 
 def run_generation_models(user_query):
-    runs = {}
-    for model_name in st.session_state.generation_models:
+    generation_models = list(st.session_state.generation_models)
+
+    # Build/cache executors first to avoid session-state races during parallel work.
+    executors = {}
+    for model_name in generation_models:
+        executors[model_name] = get_or_create_agent_executor(model_name)
+
+    def run_single_model(model_name):
+        start_time = time.time()
         try:
-            executor = get_or_create_agent_executor(model_name)
-            response = executor.invoke({"input": user_query})
+            response = executors[model_name].invoke({"input": user_query})
             output_str = response.get("output", "") if isinstance(response, dict) else str(response)
-            runs[model_name] = {
+            elapsed = time.time() - start_time
+            return {
                 "status": "ok",
                 "response": response,
                 "output": output_str,
                 "cypher": extract_cypher(output_str),
                 "error": "",
+                "elapsed_seconds": round(elapsed, 2),
             }
         except Exception as e:
+            elapsed = time.time() - start_time
             error_text = str(e)
-            runs[model_name] = {
+            return {
                 "status": "error",
                 "response": {},
                 "output": "",
                 "cypher": extract_cypher(error_text),
                 "error": error_text,
+                "elapsed_seconds": round(elapsed, 2),
             }
-    return runs
+
+    unordered_runs = {}
+    max_workers = max(1, min(len(generation_models), 8))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {
+            pool.submit(run_single_model, model_name): model_name
+            for model_name in generation_models
+        }
+        for future in as_completed(future_map):
+            model_name = future_map[future]
+            try:
+                unordered_runs[model_name] = future.result()
+            except Exception as e:
+                error_text = str(e)
+                unordered_runs[model_name] = {
+                    "status": "error",
+                    "response": {},
+                    "output": "",
+                    "cypher": extract_cypher(error_text),
+                    "error": error_text,
+                }
+
+    # Preserve display order configured in generation_models.
+    return {model_name: unordered_runs.get(model_name, {
+        "status": "error",
+        "response": {},
+        "output": "",
+        "cypher": "",
+        "error": "No result returned.",
+    }) for model_name in generation_models}
 
 
 def judge_best_cypher(user_query, model_runs):
@@ -782,6 +823,7 @@ with user_col:
                 run_rows.append({
                     "model": model_name,
                     "status": run_data.get("status", ""),
+                    "elapsed_time": f"{run_data.get('elapsed_seconds', 0)}s",
                     "has_cypher": bool(run_data.get("cypher")),
                     "error": run_data.get("error", "")[:140],
                 })
