@@ -13,3 +13,4 @@ pymgclient
 streamlit
 streamlit_chat
 streamlit_chatbox
+altair<5
