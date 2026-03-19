@@ -69,7 +69,7 @@ AIX_API_BASE_URL =  "https://api.x.ai/v1"
 AIX_MODELS = [
     m.strip() for m in os.getenv(
         "AIX_MODELS",
-        "grok-4.20-beta-0309-reasoning,grok-4-fast,grok-3-mini-fast"
+        "grok-code-fast-1,grok-4-fast,grok-3-mini-fast"
     ).split(",") if m.strip()
 ]
 AIX_JUDGE_MODEL = os.getenv("AIX_JUDGE_MODEL", "grok-4.20-beta-0309-reasoning")
@@ -188,7 +188,62 @@ if "model_runs" not in st.session_state:
 if "judge_decision" not in st.session_state:
     st.session_state.judge_decision = {}
 
-def create_agent(tools, llm):
+if "property_value_hints" not in st.session_state:
+    st.session_state.property_value_hints = ""
+
+
+def build_node_property_value_hints(max_values_per_property=8):
+    """Builds a compact catalog of node labels, properties, and example values."""
+    query = """
+    MATCH (n)
+    UNWIND labels(n) AS label
+    WITH label, n, keys(n) AS prop_keys
+    UNWIND prop_keys AS prop
+    RETURN label, prop, collect(DISTINCT toString(n[prop]))[0..$max_values] AS sample_values
+    ORDER BY label, prop
+    """
+
+    catalog = {}
+    try:
+        st.session_state.mem_db.cursor.execute(query, {"max_values": int(max_values_per_property)})
+        rows = st.session_state.mem_db.cursor.fetchall()
+        for row in rows:
+            label, prop, sample_values = row[0], row[1], row[2]
+            if label not in catalog:
+                catalog[label] = {}
+            cleaned_values = []
+            for value in (sample_values or []):
+                value_str = str(value)
+                if len(value_str) > 60:
+                    value_str = value_str[:57] + "..."
+                cleaned_values.append(value_str)
+            catalog[label][prop] = cleaned_values
+    except Exception:
+        return "Property catalog unavailable."
+
+    if not catalog:
+        return "Property catalog unavailable."
+
+    lines = [
+        "Property Value Hints (use these labels/properties and value patterns when filtering):"
+    ]
+    for label in sorted(catalog.keys()):
+        lines.append(f"- {label}")
+        for prop in sorted(catalog[label].keys()):
+            values = catalog[label][prop]
+            preview = ", ".join(values) if values else "(no sample values)"
+            lines.append(f"  - {prop}: {preview}")
+
+    return "\n".join(lines)
+
+
+def get_property_value_hints():
+    """Returns cached property hints, rebuilding when missing."""
+    if not st.session_state.property_value_hints:
+        st.session_state.property_value_hints = build_node_property_value_hints()
+    return st.session_state.property_value_hints
+
+def create_agent(tools, llm, property_value_hints):
     template = '''You are an expert Open-Cypher data specialist who can generate complex queries based on user requirements to answer their questions using Open-Cypher.Answer the following questions as best you can in the form of a Cypher query. You have access to the following tools:
     
     {tools}
@@ -202,6 +257,9 @@ def create_agent(tools, llm):
     All nodes are lowercase and all relationships are lowercase
     Never use gender only use demographic.sex
     Don't use directional relationships in the cypher, the direction does not matter and can cause confusion for the model
+    Stop using term and input the exact term asked for in the question when filtering, do not use a placeholder term
+
+    {property_value_hints}
     
     Cypher Rules:
         when the variable is not a number then use the following filtering format WHERE ANY(term IN [term] WHERE tolower(variable) CONTAINS term) 
@@ -224,6 +282,7 @@ def create_agent(tools, llm):
     Question: {input}
     Thought:{agent_scratchpad}'''
     prompt = PromptTemplate.from_template(template)
+    prompt = prompt.partial(property_value_hints=property_value_hints)
     
     # xAI grok models can reject the OpenAI-style `stop` parameter; disable stop sequence injection.
     try:
@@ -240,7 +299,12 @@ def create_agent(tools, llm):
 def get_or_create_agent_executor(model_name):
     if model_name not in st.session_state.agent_executors:
         llm = build_chat_model(model_name)
-        st.session_state.agent_executors[model_name] = create_agent(st.session_state.tools, llm)
+        property_value_hints = get_property_value_hints()
+        st.session_state.agent_executors[model_name] = create_agent(
+            st.session_state.tools,
+            llm,
+            property_value_hints,
+        )
     return st.session_state.agent_executors[model_name]
 
 
@@ -377,6 +441,58 @@ Return strict JSON only — no markdown, no extra text — with these keys:
         return corrected, notes
     except Exception as e:
         return cypher, f"Schema validation skipped: {e}"
+
+
+MAX_REPAIR_ATTEMPTS = 3
+
+
+def explain_cypher(cypher):
+    """Run EXPLAIN on the query. Returns (ok: bool, error_msg: str)."""
+    try:
+        st.session_state.mem_db.cursor.execute(f"EXPLAIN {cypher}")
+        st.session_state.mem_db.cursor.fetchall()
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def repair_cypher_with_feedback(cypher, user_query, error_msg, attempt):
+    """Ask the judge model to fix a Cypher query given a concrete Memgraph EXPLAIN error."""
+    repair_prompt = f"""You are a Cypher repair agent for a Memgraph database.
+
+The following Cypher query failed when validated with EXPLAIN (attempt {attempt}).
+
+User question:
+{user_query}
+
+Failed Cypher:
+{cypher}
+
+Memgraph error:
+{error_msg}
+
+Instructions:
+1. Fix only what the error message describes — syntax, unknown labels, wrong relationship types, invalid property access, etc.
+2. Do not change the intent or structure of the query beyond what is necessary to fix the error.
+3. Do not use GROUP BY.
+4. Use ANY(term IN [value] WHERE tolower(variable) CONTAINS term) for string filters.
+5. Do not use directional relationships.
+
+Return strict JSON only — no markdown — with keys:
+- repaired_cypher: the fixed Cypher string
+- repair_notes: one sentence describing what was changed
+"""
+    try:
+        judge_model = build_chat_model(st.session_state.judge_model_name)
+        resp = judge_model.invoke(repair_prompt)
+        resp_text = resp.content if hasattr(resp, "content") else str(resp)
+        json_match = re.search(r"\{[\s\S]*\}", resp_text)
+        if not json_match:
+            raise ValueError("Repair output was not valid JSON.")
+        parsed = json.loads(json_match.group(0))
+        return parsed.get("repaired_cypher", cypher).strip(), parsed.get("repair_notes", "")
+    except Exception as e:
+        return cypher, f"Repair skipped: {e}"
 
 
 def summarize_result_table(df, user_question, cypher_query):
@@ -598,14 +714,36 @@ with user_col:
 
             st.session_state.judge_decision["validated_cypher"] = validated_cypher
             st.session_state.judge_decision["validation_notes"] = validation_notes
-            st.session_state.cypher_str = validated_cypher
+
+            # Execution-feedback repair loop — EXPLAIN against live DB, repair on failure
+            repair_log = []
+            working_cypher = validated_cypher
+            if working_cypher:
+                for attempt in range(1, MAX_REPAIR_ATTEMPTS + 1):
+                    ok, error_msg = explain_cypher(working_cypher)
+                    if ok:
+                        repair_log.append({"attempt": attempt, "status": "✅ EXPLAIN passed", "notes": ""})
+                        break
+                    repaired, notes = repair_cypher_with_feedback(working_cypher, user_query, error_msg, attempt)
+                    repair_log.append({"attempt": attempt, "status": f"❌ EXPLAIN failed", "notes": f"{error_msg[:120]} → {notes}"})
+                    working_cypher = repaired
+                else:
+                    # Final EXPLAIN after last repair attempt
+                    ok, error_msg = explain_cypher(working_cypher)
+                    if not ok:
+                        repair_log.append({"attempt": MAX_REPAIR_ATTEMPTS + 1, "status": "⚠️ Could not fix after max attempts", "notes": error_msg[:120]})
+
+            st.session_state.judge_decision["repair_log"] = repair_log
+            st.session_state.cypher_str = working_cypher
 
             selected_model = st.session_state.judge_decision.get("selected_model", "")
             if selected_model and selected_model in st.session_state.model_runs:
                 st.session_state.response = st.session_state.model_runs[selected_model].get("response", {})
 
             if st.session_state.cypher_str:
-                st.success("✅ Query generated, judge-selected, and schema-validated.")
+                passed = any("passed" in r["status"] for r in repair_log)
+                label = "✅ Query generated, validated, and EXPLAIN-verified." if passed else "✅ Query generated and validated (EXPLAIN unavailable)."
+                st.success(label)
             else:
                 st.warning("No Cypher query was generated by the configured models.")
 
@@ -657,6 +795,10 @@ with user_col:
                 validation_notes = st.session_state.judge_decision.get("validation_notes", "")
                 if validation_notes:
                     st.write(f"Schema validation: {validation_notes}")
+                repair_log = st.session_state.judge_decision.get("repair_log", [])
+                if repair_log:
+                    st.write("EXPLAIN repair log")
+                    st.dataframe(pd.DataFrame(repair_log), use_container_width=True)
 
         if st.session_state.cypher_str != "":
             try:
