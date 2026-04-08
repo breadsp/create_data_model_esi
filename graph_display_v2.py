@@ -71,7 +71,7 @@ AIX_API_BASE_URL =  "https://api.x.ai/v1"
 AIX_MODELS = [
     m.strip() for m in os.getenv(
         "AIX_MODELS",
-        "grok-code-fast-1,grok-4-fast,grok-3-mini-fast"
+        "grok-4-fast,grok-3-mini-fast"
     ).split(",") if m.strip()
 ]
 AIX_JUDGE_MODEL = os.getenv("AIX_JUDGE_MODEL", "grok-4.20-beta-0309-reasoning")
