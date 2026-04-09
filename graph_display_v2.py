@@ -25,6 +25,17 @@ from langchain_core.prompts import PromptTemplate
 
 pd.options.mode.chained_assignment = None
 
+from pathlib import Path
+import toml
+
+user_profile_path = Path.home()
+config_path = os.path.join(user_profile_path , ".streamlit", "credentials.toml")
+
+# Read the TOML file if it exists
+if os.path.isfile(config_path):
+    with open(config_path, "r") as f:
+        config_data = toml.load(f)
+
 # Streamlit Page Configuration
 # --- Streamlit UI ---
 
@@ -77,6 +88,15 @@ AIX_MODELS = [
 AIX_JUDGE_MODEL = os.getenv("AIX_JUDGE_MODEL", "grok-4.20-beta-0309-reasoning")
 AIX_INSECURE_SSL = os.getenv("AIX_INSECURE_SSL", "false").lower() == "true"
 
+AIX_API_KEY = config_data["API_Key"]["AIX_API_KEY"]
+
+MEMGRAPH_HOST = config_data["Memgraph_Creds"]["MEM_HOST"]
+MEMGRAPH_PORT = config_data["Memgraph_Creds"]["MEM_PORT"]
+
+MEMGRAPH_USER = config_data["Memgraph_Creds"]["MEM_USER"]
+MEMGRAPH_PASS = config_data["Memgraph_Creds"]["MEM_PASS"]
+
+
 if not AIX_API_KEY:
     st.error("Missing AIX_API_KEY environment variable.")
     st.stop()
@@ -97,10 +117,10 @@ def build_chat_model(model_name):
 
 class Memgraph_DB():
     def __init__(self):
-        self.host = "127.0.0.1"
-        self.port =  7687
-        self.username = ""
-        self.password = ""
+        self.host =  MEMGRAPH_HOST
+        self.port =   MEMGRAPH_PORT
+        self.username = MEMGRAPH_USER
+        self.password = MEMGRAPH_PASS
     def connect_to_db(self): 
         self.conn = mgclient.connect(host=self.host, port=self.port, username=self.username, password=self.password)
         self.cursor = self.conn.cursor()
@@ -120,7 +140,9 @@ if "mem_db" not in st.session_state:
     st.session_state.mem_db = get_memgraph_client()
 
 if st.session_state.mem_db is None:
-    st.error("Memgraph is not reachable at 127.0.0.1:7687.")
+    host = st.session_state.mem_db.host
+    port = st.session_state.mem_db.port
+    st.error(f"Memgraph is not reachable at {host}:{port}.")
     st.info("Start Memgraph first, then refresh this page.")
     st.stop()
 
@@ -731,6 +753,9 @@ with user_col:
         
         if clear_button:
             st.rerun()
+        
+    if user_query:
+        print(user_query)
             
     if submit_button and user_query:
         st.divider()
@@ -766,7 +791,7 @@ with user_col:
                         repair_log.append({"attempt": attempt, "status": "✅ EXPLAIN passed", "notes": ""})
                         break
                     repaired, notes = repair_cypher_with_feedback(working_cypher, user_query, error_msg, attempt)
-                    repair_log.append({"attempt": attempt, "status": f"❌ EXPLAIN failed", "notes": f"{error_msg[:120]} → {notes}"})
+                    repair_log.append({"attempt": attempt, "status": "❌ EXPLAIN failed", "notes": f"{error_msg[:120]} → {notes}"})
                     working_cypher = repaired
                 else:
                     # Final EXPLAIN after last repair attempt
