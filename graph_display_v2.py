@@ -2,7 +2,7 @@
 """
 Created on Thu Jan 29 10:42:59 2026
 
-@author: breadsp2
+@author: breadsp2,adam
 """
 
 import streamlit as st
@@ -28,12 +28,13 @@ pd.options.mode.chained_assignment = None
 from pathlib import Path
 import toml
 
-user_profile_path = Path.home()
-config_path = os.path.join(user_profile_path , ".streamlit", "credentials.toml")
+workspace_config_path = Path.cwd() / ".streamlit" / "credentials.toml"
+home_config_path = Path.home() / ".streamlit" / "credentials.toml"
+config_path = workspace_config_path if workspace_config_path.is_file() else home_config_path
 
-# Read the TOML file if it exists
-if os.path.isfile(config_path):
-    with open(config_path, "r") as f:
+config_data = {}
+if config_path.is_file():
+    with open(config_path, "r", encoding="utf-8") as f:
         config_data = toml.load(f)
 
 # Streamlit Page Configuration
@@ -78,6 +79,7 @@ st.markdown("<h1 class='no-space' style='text-align: center; color: black; font-
              unsafe_allow_html=True)
 
 # xAI API configuration
+AIX_API_KEY = ""
 AIX_API_BASE_URL =  "https://api.x.ai/v1"
 AIX_MODELS = [
     m.strip() for m in os.getenv(
@@ -88,13 +90,13 @@ AIX_MODELS = [
 AIX_JUDGE_MODEL = os.getenv("AIX_JUDGE_MODEL", "grok-4.20-beta-0309-reasoning")
 AIX_INSECURE_SSL = os.getenv("AIX_INSECURE_SSL", "false").lower() == "true"
 
-AIX_API_KEY = config_data["API_Key"]["AIX_API_KEY"]
+AIX_API_KEY = config_data.get("API_Key", {}).get("AIX_API_KEY", os.getenv("AIX_API_KEY", ""))
 
-MEMGRAPH_HOST = config_data["Memgraph_Creds"]["MEM_HOST"]
-MEMGRAPH_PORT = config_data["Memgraph_Creds"]["MEM_PORT"]
+MEMGRAPH_HOST = config_data.get("Memgraph_Creds", {}).get("MEM_HOST", os.getenv("MEMGRAPH_HOST", "127.0.0.1"))
+MEMGRAPH_PORT = int(config_data.get("Memgraph_Creds", {}).get("MEM_PORT", os.getenv("MEMGRAPH_PORT", "7687")))
 
-MEMGRAPH_USER = config_data["Memgraph_Creds"]["MEM_USER"]
-MEMGRAPH_PASS = config_data["Memgraph_Creds"]["MEM_PASS"]
+MEMGRAPH_USER = config_data.get("Memgraph_Creds", {}).get("MEM_USER", os.getenv("MEMGRAPH_USER", ""))
+MEMGRAPH_PASS = config_data.get("Memgraph_Creds", {}).get("MEM_PASS", os.getenv("MEMGRAPH_PASS", ""))
 
 
 if not AIX_API_KEY:
@@ -408,6 +410,7 @@ def judge_best_cypher(user_query, model_runs):
             "selected_model": "",
             "selected_cypher": "",
             "reason": "No model produced a Cypher query.",
+            "elapsed_seconds": 0.0,
         }
 
     if len(candidates) == 1:
@@ -415,6 +418,7 @@ def judge_best_cypher(user_query, model_runs):
             "selected_model": candidates[0]["model"],
             "selected_cypher": candidates[0]["cypher"],
             "reason": "Only one model produced Cypher.",
+            "elapsed_seconds": 0.0,
         }
 
     judge_prompt = f"""
@@ -429,6 +433,7 @@ Candidates:
 Return strict JSON only with keys: selected_model, selected_cypher, reason.
 """
 
+    start_time = time.time()
     try:
         judge_model = build_chat_model(st.session_state.judge_model_name)
         judge_resp = judge_model.invoke(judge_prompt)
@@ -437,23 +442,27 @@ Return strict JSON only with keys: selected_model, selected_cypher, reason.
         if not json_match:
             raise ValueError("Judge output was not valid JSON.")
         parsed = json.loads(json_match.group(0))
+        elapsed = round(time.time() - start_time, 2)
         return {
             "selected_model": parsed.get("selected_model", ""),
             "selected_cypher": parsed.get("selected_cypher", ""),
             "reason": parsed.get("reason", "Judge provided no reason."),
+            "elapsed_seconds": elapsed,
         }
     except Exception as e:
+        elapsed = round(time.time() - start_time, 2)
         return {
             "selected_model": candidates[0]["model"],
             "selected_cypher": candidates[0]["cypher"],
             "reason": f"Judge fallback used: {e}",
+            "elapsed_seconds": elapsed,
         }
 
 
 def validate_cypher_against_schema(cypher, user_query):
     """Ask the judge model to verify the selected Cypher against the known schema and fix any mismatches."""
     if not cypher:
-        return cypher, "No Cypher to validate."
+        return cypher, "No Cypher to validate.", 0.0
 
     # Build schema description from session state
     schema_lines = []
@@ -491,6 +500,7 @@ Return strict JSON only — no markdown, no extra text — with these keys:
 - validation_notes: one-sentence description of issues found and corrections made, or "Query matches schema." if valid
 """
 
+    start_time = time.time()
     try:
         judge_model = build_chat_model(st.session_state.judge_model_name)
         resp = judge_model.invoke(validation_prompt)
@@ -501,9 +511,11 @@ Return strict JSON only — no markdown, no extra text — with these keys:
         parsed = json.loads(json_match.group(0))
         corrected = parsed.get("corrected_cypher", cypher).strip()
         notes = parsed.get("validation_notes", "")
-        return corrected, notes
+        elapsed = round(time.time() - start_time, 2)
+        return corrected, notes, elapsed
     except Exception as e:
-        return cypher, f"Schema validation skipped: {e}"
+        elapsed = round(time.time() - start_time, 2)
+        return cypher, f"Schema validation skipped: {e}", elapsed
 
 
 MAX_REPAIR_ATTEMPTS = 3
@@ -545,6 +557,7 @@ Return strict JSON only — no markdown — with keys:
 - repaired_cypher: the fixed Cypher string
 - repair_notes: one sentence describing what was changed
 """
+    start_time = time.time()
     try:
         judge_model = build_chat_model(st.session_state.judge_model_name)
         resp = judge_model.invoke(repair_prompt)
@@ -553,9 +566,11 @@ Return strict JSON only — no markdown — with keys:
         if not json_match:
             raise ValueError("Repair output was not valid JSON.")
         parsed = json.loads(json_match.group(0))
-        return parsed.get("repaired_cypher", cypher).strip(), parsed.get("repair_notes", "")
+        elapsed = round(time.time() - start_time, 2)
+        return parsed.get("repaired_cypher", cypher).strip(), parsed.get("repair_notes", ""), elapsed
     except Exception as e:
-        return cypher, f"Repair skipped: {e}"
+        elapsed = round(time.time() - start_time, 2)
+        return cypher, f"Repair skipped: {e}", elapsed
 
 
 def summarize_result_table(df, user_question, cypher_query):
@@ -766,15 +781,24 @@ with user_col:
         st.session_state.result_summary = ""
         st.session_state.last_summary_query = ""
         st.session_state.last_user_query = user_query
+        judge_timing_rows = []
         try:
             st.session_state.model_runs = run_generation_models(user_query)
             st.session_state.judge_decision = judge_best_cypher(user_query, st.session_state.model_runs)
+            judge_timing_rows.append({
+                "step": "best_cypher_selection",
+                "elapsed_seconds": st.session_state.judge_decision.get("elapsed_seconds", 0.0),
+            })
 
             selected_cypher = st.session_state.judge_decision.get("selected_cypher", "")
 
             # Schema validation pass — judge reviews its own selection against actual schema
             if selected_cypher:
-                validated_cypher, validation_notes = validate_cypher_against_schema(selected_cypher, user_query)
+                validated_cypher, validation_notes, validation_elapsed = validate_cypher_against_schema(selected_cypher, user_query)
+                judge_timing_rows.append({
+                    "step": "schema_validation",
+                    "elapsed_seconds": validation_elapsed,
+                })
             else:
                 validated_cypher, validation_notes = "", "No Cypher to validate."
 
@@ -790,8 +814,12 @@ with user_col:
                     if ok:
                         repair_log.append({"attempt": attempt, "status": "✅ EXPLAIN passed", "notes": ""})
                         break
-                    repaired, notes = repair_cypher_with_feedback(working_cypher, user_query, error_msg, attempt)
-                    repair_log.append({"attempt": attempt, "status": "❌ EXPLAIN failed", "notes": f"{error_msg[:120]} → {notes}"})
+                    repaired, notes, repair_elapsed = repair_cypher_with_feedback(working_cypher, user_query, error_msg, attempt)
+                    judge_timing_rows.append({
+                        "step": f"repair_attempt_{attempt}",
+                        "elapsed_seconds": repair_elapsed,
+                    })
+                    repair_log.append({"attempt": attempt, "status": f"❌ EXPLAIN failed", "notes": f"{error_msg[:120]} → {notes}"})
                     working_cypher = repaired
                 else:
                     # Final EXPLAIN after last repair attempt
@@ -800,6 +828,7 @@ with user_col:
                         repair_log.append({"attempt": MAX_REPAIR_ATTEMPTS + 1, "status": "⚠️ Could not fix after max attempts", "notes": error_msg[:120]})
 
             st.session_state.judge_decision["repair_log"] = repair_log
+            st.session_state.judge_decision["judge_timing_rows"] = judge_timing_rows
             st.session_state.cypher_str = working_cypher
 
             selected_model = st.session_state.judge_decision.get("selected_model", "")
@@ -859,9 +888,14 @@ with user_col:
                 st.write("Judge selection")
                 st.write(f"Selected model: {st.session_state.judge_decision.get('selected_model', 'n/a')}")
                 st.write(st.session_state.judge_decision.get("reason", ""))
+                st.write(f"Selection runtime: {st.session_state.judge_decision.get('elapsed_seconds', 0)}s")
                 validation_notes = st.session_state.judge_decision.get("validation_notes", "")
                 if validation_notes:
                     st.write(f"Schema validation: {validation_notes}")
+                judge_timing_rows = st.session_state.judge_decision.get("judge_timing_rows", [])
+                if judge_timing_rows:
+                    st.write("Judge model runtimes")
+                    st.dataframe(pd.DataFrame(judge_timing_rows), use_container_width=True)
                 repair_log = st.session_state.judge_decision.get("repair_log", [])
                 if repair_log:
                     st.write("EXPLAIN repair log")
