@@ -14,7 +14,6 @@ import json
 import httpx
 import time
 import sys
-
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from streamlit_agraph import agraph, Node, Edge, Config
@@ -294,6 +293,10 @@ def create_agent(tools, llm, property_value_hints):
         lowercase all values expcet for the Cypher Key Words
         Only use enough tools to generate the Cypher
         Do no use " in the return statement, use ` instead
+        Do not use ≥ or ≤ , use >= or <= instead
+        Always return a total count as number_of_records
+        If the user filters by a specific property, always include that property in the RETURN statement as an alias (e.g., RETURN node.property AS property).
+        
 
     
     Question: the input question you must answer
@@ -488,9 +491,10 @@ Cypher to validate:
 Instructions:
 1. Check that every node label used in the Cypher appears in the schema.
 2. Check that every relationship type used in the Cypher appears in the schema.
-3. If the Cypher is already correct for the schema, return it unchanged.
-4. If there are label or relationship mismatches, fix them using the closest valid schema element.
-5. Do not change query logic, only fix label/relationship names that deviate from the schema.
+3. Check that every property in the Where statement is also in the Return statement
+4. If the Cypher is already correct for the schema, return it unchanged.
+5. If there are label or relationship mismatches, fix them using the closest valid schema element.
+6. Do not change query logic, only fix label/relationship names that deviate from the schema.
 
 Return strict JSON only — no markdown, no extra text — with these keys:
 - is_valid: boolean
@@ -650,7 +654,7 @@ def get_graph_data():
     }
     return graph_data
 
-def make_schema(node_df, edge_df, contain_height):
+def make_schema(node_df, edge_df):
     nodes_agraph = [Node(id=node_df.loc[node, "index"], label=node_df.loc[node, "label"], 
                       size=25, shape="dot", color = node_df.loc[node, "color"]) for node in node_df.index]
 # color="#FF0000")) # Red, 
@@ -660,12 +664,11 @@ def make_schema(node_df, edge_df, contain_height):
                      label="") for edge in edge_df.index]
                      #label=final_df_edge.loc[edge, 'label']) for edge in final_df_edge.index]
 
-    config = Config(height=contain_height-50, width = "100%",  direction = "RL", directed=False,
+    config = Config(height=275,  width=600, direction = "LR",
                     #height=350,  width=500,
-                    #directed=True, #fit=True, # edgeMinimization = False,
+                    directed=True, fit=True, edgeMinimization = False,
                     nodeHighlightColor="#FFAE42", linkHighlightColor="#FFB6C1",
-                    displayNodeImage=True, physics=False,  #hierarchical=True,
-                   # staticGraphWithDragAndDrop=True, 
+                    displayNodeImage=True, hierarchical=True,
                     #nodeSpacing= 350, treeSpacing =  200, edgeMinimization = False,
                     #direction = "LR", blockShifting = False,
                    # physics={"enabled": True},  # Stops nodes from moving
@@ -780,9 +783,9 @@ with st.container(height=400, border=True):
                     st.session_state.df_list = []
                     st.rerun()
                     
-            with st.container(height=300, border=True, vertical_alignment="center"):
+            with st.container(height=300, border=True): #, vertical_alignment="center"):
             
-                nodes_agraph, edges_agraph, config = make_schema(st.session_state.node_df, st.session_state.final_df_edge, 300)
+                nodes_agraph, edges_agraph, config = make_schema(st.session_state.node_df, st.session_state.final_df_edge)
                 node_clicked = agraph(nodes_agraph, edges_agraph, config) 
              
                 if node_clicked:
