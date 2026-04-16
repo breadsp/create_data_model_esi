@@ -84,11 +84,11 @@ AIX_API_BASE_URL =  "https://api.x.ai/v1"
 AIX_MODELS = [
     m.strip() for m in os.getenv(
         "AIX_MODELS",
-        "grok-4-fast,grok-3-mini-fast"
+        "grok-4-fast-reasoning,grok-3-mini"
     ).split(",") if m.strip()
 ]
-AIX_JUDGE_MODEL = os.getenv("AIX_JUDGE_MODEL", "grok-4.20-beta-0309-reasoning")
-AIX_INSECURE_SSL = os.getenv("AIX_INSECURE_SSL", "false").lower() == "true"
+AIX_JUDGE_MODEL = os.getenv("AIX_JUDGE_MODEL", "grok-4.20-0309-reasoning")
+AIX_INSECURE_SSL = "true"
 
 AIX_API_KEY = config_data.get("API_Key", {}).get("AIX_API_KEY", os.getenv("AIX_API_KEY", ""))
 
@@ -269,6 +269,51 @@ def get_property_value_hints():
         st.session_state.property_value_hints = build_node_property_value_hints()
     return st.session_state.property_value_hints
 
+
+MUTATING_CYPHER_PATTERNS = [
+    ("CREATE", r"\bCREATE\b"),
+    ("MERGE", r"\bMERGE\b"),
+    ("DELETE", r"\bDELETE\b"),
+    ("DETACH DELETE", r"\bDETACH\s+DELETE\b"),
+    ("SET", r"\bSET\b"),
+    ("REMOVE", r"\bREMOVE\b"),
+    ("DROP", r"\bDROP\b"),
+    ("ALTER", r"\bALTER\b"),
+    ("RENAME", r"\bRENAME\b"),
+    ("TRUNCATE", r"\bTRUNCATE\b"),
+    ("FOREACH", r"\bFOREACH\b"),
+    ("LOAD CSV", r"\bLOAD\s+CSV\b"),
+    ("CALL DBMS", r"\bCALL\s+DBMS\b"),
+    ("CALL MG", r"\bCALL\s+MG\b"),
+    ("CALL APOC WRITE", r"\bCALL\s+APOC\.(CREATE|MERGE|REFACTOR|PERIODIC\.ITERATE|DO\.WHEN|DO\.CASE)\b"),
+    ("GRANT", r"\bGRANT\b"),
+    ("DENY", r"\bDENY\b"),
+    ("REVOKE", r"\bREVOKE\b"),
+    ("INSTALL", r"\bINSTALL\b"),
+    ("UNINSTALL", r"\bUNINSTALL\b"),
+]
+
+
+def find_mutating_keywords(cypher_query):
+    """Return mutating keywords/patterns found in a Cypher query."""
+    if not cypher_query:
+        return []
+
+    # Remove comments and quoted strings to reduce false positives.
+    normalized = re.sub(r"//.*?$|/\*[\s\S]*?\*/", " ", cypher_query, flags=re.MULTILINE)
+    normalized = re.sub(r"'(?:''|[^'])*'|\"(?:\\.|[^\"])*\"", " ", normalized)
+    normalized = normalized.upper()
+
+    matches = []
+    for label, pattern in MUTATING_CYPHER_PATTERNS:
+        if re.search(pattern, normalized):
+            matches.append(label)
+    return matches
+
+
+def is_read_only_cypher(cypher_query):
+    return len(find_mutating_keywords(cypher_query)) == 0
+
 def create_agent(tools, llm, property_value_hints):
     template = '''You are an expert Open-Cypher data specialist who can generate complex queries based on user requirements to answer their questions using Open-Cypher.Answer the following questions as best you can in the form of a Cypher query. You have access to the following tools:
     
@@ -284,6 +329,8 @@ def create_agent(tools, llm, property_value_hints):
     Never use gender only use demographic.sex
     Don't use directional relationships in the cypher, the direction does not matter and can cause confusion for the model
     Stop using term and input the exact term asked for in the question when filtering, do not use a placeholder term
+    You must generate read-only Cypher only. Never generate data-changing or schema-changing queries.
+    Forbidden keywords/patterns: {blocked_write_keywords}
 
     {property_value_hints}
     
@@ -308,7 +355,10 @@ def create_agent(tools, llm, property_value_hints):
     Question: {input}
     Thought:{agent_scratchpad}'''
     prompt = PromptTemplate.from_template(template)
-    prompt = prompt.partial(property_value_hints=property_value_hints)
+    prompt = prompt.partial(
+        property_value_hints=property_value_hints,
+        blocked_write_keywords=", ".join([label for label, _ in MUTATING_CYPHER_PATTERNS]),
+    )
     
     # xAI grok models can reject the OpenAI-style `stop` parameter; disable stop sequence injection.
     try:
@@ -347,12 +397,23 @@ def run_generation_models(user_query):
         try:
             response = executors[model_name].invoke({"input": user_query})
             output_str = response.get("output", "") if isinstance(response, dict) else str(response)
+            cypher = extract_cypher(output_str)
+            blocked_keywords = find_mutating_keywords(cypher)
             elapsed = time.time() - start_time
+            if cypher and blocked_keywords:
+                return {
+                    "status": "blocked",
+                    "response": response,
+                    "output": output_str,
+                    "cypher": "",
+                    "error": f"Blocked mutating query keywords: {', '.join(blocked_keywords)}",
+                    "elapsed_seconds": round(elapsed, 2),
+                }
             return {
                 "status": "ok",
                 "response": response,
                 "output": output_str,
-                "cypher": extract_cypher(output_str),
+                "cypher": cypher,
                 "error": "",
                 "elapsed_seconds": round(elapsed, 2),
             }
@@ -401,15 +462,23 @@ def run_generation_models(user_query):
 
 def judge_best_cypher(user_query, model_runs):
     candidates = []
+    rejected_candidates = []
     for model_name, run_data in model_runs.items():
         if run_data.get("cypher"):
+            blocked_keywords = find_mutating_keywords(run_data["cypher"])
+            if blocked_keywords:
+                rejected_candidates.append({"model": model_name, "blocked_keywords": blocked_keywords})
+                continue
             candidates.append({"model": model_name, "cypher": run_data["cypher"]})
 
     if not candidates:
+        rejected_note = ""
+        if rejected_candidates:
+            rejected_note = f" Unsafe candidates rejected: {json.dumps(rejected_candidates)}"
         return {
             "selected_model": "",
             "selected_cypher": "",
-            "reason": "No model produced a Cypher query.",
+            "reason": f"No safe read-only Cypher query produced.{rejected_note}",
             "elapsed_seconds": 0.0,
         }
 
@@ -423,6 +492,10 @@ def judge_best_cypher(user_query, model_runs):
 
     judge_prompt = f"""
 You are a Cypher judge. Choose the best query for the user's question.
+Only select read-only queries. Reject any query that contains mutating/editing keywords.
+
+Forbidden keywords/patterns:
+{", ".join([label for label, _ in MUTATING_CYPHER_PATTERNS])}
 
 Question:
 {user_query}
@@ -493,6 +566,7 @@ Instructions:
 3. If the Cypher is already correct for the schema, return it unchanged.
 4. If there are label or relationship mismatches, fix them using the closest valid schema element.
 5. Do not change query logic, only fix label/relationship names that deviate from the schema.
+6. Do not introduce any mutating/editing keyword (CREATE, MERGE, DELETE, SET, REMOVE, DROP, FOREACH, LOAD CSV, GRANT, DENY, REVOKE, INSTALL, UNINSTALL).
 
 Return strict JSON only — no markdown, no extra text — with these keys:
 - is_valid: boolean
@@ -523,6 +597,9 @@ MAX_REPAIR_ATTEMPTS = 3
 
 def explain_cypher(cypher):
     """Run EXPLAIN on the query. Returns (ok: bool, error_msg: str)."""
+    blocked_keywords = find_mutating_keywords(cypher)
+    if blocked_keywords:
+        return False, f"Blocked mutating query keywords: {', '.join(blocked_keywords)}"
     try:
         st.session_state.mem_db.cursor.execute(f"EXPLAIN {cypher}")
         st.session_state.mem_db.cursor.fetchall()
@@ -552,6 +629,7 @@ Instructions:
 3. Do not use GROUP BY.
 4. Use ANY(term IN [value] WHERE tolower(variable) CONTAINS term) for string filters.
 5. Do not use directional relationships.
+6. Output read-only Cypher only. Never use mutating/editing keywords: CREATE, MERGE, DELETE, DETACH DELETE, SET, REMOVE, DROP, FOREACH, LOAD CSV, GRANT, DENY, REVOKE, INSTALL, UNINSTALL.
 
 Return strict JSON only — no markdown — with keys:
 - repaired_cypher: the fixed Cypher string
@@ -829,7 +907,15 @@ with user_col:
 
             st.session_state.judge_decision["repair_log"] = repair_log
             st.session_state.judge_decision["judge_timing_rows"] = judge_timing_rows
-            st.session_state.cypher_str = working_cypher
+            final_blocked_keywords = find_mutating_keywords(working_cypher)
+            if final_blocked_keywords:
+                st.session_state.cypher_str = ""
+                st.session_state.judge_decision["reason"] = (
+                    f"Rejected unsafe query. Blocked keywords: {', '.join(final_blocked_keywords)}"
+                )
+                st.error(f"Blocked query from execution due to mutating keywords: {', '.join(final_blocked_keywords)}")
+            else:
+                st.session_state.cypher_str = working_cypher
 
             selected_model = st.session_state.judge_decision.get("selected_model", "")
             if selected_model and selected_model in st.session_state.model_runs:
@@ -904,6 +990,9 @@ with user_col:
         if st.session_state.cypher_str != "":
             try:
                 query = st.session_state.cypher_str.strip()
+                blocked_keywords = find_mutating_keywords(query)
+                if blocked_keywords:
+                    raise ValueError(f"Blocked query due to mutating keywords: {', '.join(blocked_keywords)}")
                 st.session_state.mem_db.cursor.execute(query)
                 result = st.session_state.mem_db.cursor.fetchall()
                 columns = [desc.name for desc in st.session_state.mem_db.cursor.description]
