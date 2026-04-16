@@ -13,6 +13,7 @@ import os
 import json
 import httpx
 import time
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from streamlit_agraph import agraph, Node, Edge, Config
@@ -140,6 +141,9 @@ def get_memgraph_client():
 
 if "mem_db" not in st.session_state:
     st.session_state.mem_db = get_memgraph_client()
+    
+if "df" not in st.session_state:
+    st.session_state.df = pd.DataFrame()
 
 if st.session_state.mem_db is None:
     host = st.session_state.mem_db.host
@@ -166,7 +170,6 @@ def get_mem_tools(db):
 
 if "tools" not in st.session_state:
     st.session_state.tools = get_mem_tools(st.session_state.db)
-
 
 def extract_cypher(output_str):
     """Extract a Cypher statement from model output."""
@@ -217,7 +220,6 @@ if "judge_decision" not in st.session_state:
 if "property_value_hints" not in st.session_state:
     st.session_state.property_value_hints = ""
 
-
 def build_node_property_value_hints(max_values_per_property=8):
     """Builds a compact catalog of node labels, properties, and example values."""
     query = """
@@ -261,7 +263,6 @@ def build_node_property_value_hints(max_values_per_property=8):
             lines.append(f"  - {prop}: {preview}")
 
     return "\n".join(lines)
-
 
 def get_property_value_hints():
     """Returns cached property hints, rebuilding when missing."""
@@ -371,7 +372,6 @@ def create_agent(tools, llm, property_value_hints):
                                    return_intermediate_steps=False, tool_choice="auto")
     return agent_executor
 
-
 def get_or_create_agent_executor(model_name):
     if model_name not in st.session_state.agent_executors:
         llm = build_chat_model(model_name)
@@ -382,7 +382,6 @@ def get_or_create_agent_executor(model_name):
             property_value_hints,
         )
     return st.session_state.agent_executors[model_name]
-
 
 def run_generation_models(user_query):
     generation_models = list(st.session_state.generation_models)
@@ -459,7 +458,6 @@ def run_generation_models(user_query):
         "error": "No result returned.",
     }) for model_name in generation_models}
 
-
 def judge_best_cypher(user_query, model_runs):
     candidates = []
     rejected_candidates = []
@@ -530,7 +528,6 @@ Return strict JSON only with keys: selected_model, selected_cypher, reason.
             "reason": f"Judge fallback used: {e}",
             "elapsed_seconds": elapsed,
         }
-
 
 def validate_cypher_against_schema(cypher, user_query):
     """Ask the judge model to verify the selected Cypher against the known schema and fix any mismatches."""
@@ -607,7 +604,6 @@ def explain_cypher(cypher):
     except Exception as e:
         return False, str(e)
 
-
 def repair_cypher_with_feedback(cypher, user_query, error_msg, attempt):
     """Ask the judge model to fix a Cypher query given a concrete Memgraph EXPLAIN error."""
     repair_prompt = f"""You are a Cypher repair agent for a Memgraph database.
@@ -650,7 +646,6 @@ Return strict JSON only — no markdown — with keys:
         elapsed = round(time.time() - start_time, 2)
         return cypher, f"Repair skipped: {e}", elapsed
 
-
 def summarize_result_table(df, user_question, cypher_query):
     """Generate a concise interpretation of query results for the Summary tab."""
     row_count = len(df)
@@ -685,7 +680,6 @@ Do not output cypher.
     except Exception as e:
         return f"Unable to generate AI summary from result table: {e}"
     
-
 def drop_date(node,date_str):
     if date_str in node.properties:
         node.properties.pop(date_str)
@@ -733,24 +727,29 @@ def get_graph_data():
     }
     return graph_data
 
-def make_schema(node_df, edge_df):
+def make_schema(node_df, edge_df, contain_height):
     nodes_agraph = [Node(id=node_df.loc[node, "index"], label=node_df.loc[node, "label"], 
                       size=25, shape="dot", color = node_df.loc[node, "color"]) for node in node_df.index]
-# color="#FF0000")) # Red
+# color="#FF0000")) # Red, 
 # color="#00FF00")) # Green
     
     edges_agraph = [Edge(source=edge_df.loc[edge, 'index_x'], target=edge_df.loc[edge, 'index_y'], 
                      label="") for edge in edge_df.index]
                      #label=final_df_edge.loc[edge, 'label']) for edge in final_df_edge.index]
 
-    config = Config(height=300,  width=600, directed=True, fit=True,
-                    nodeHighlightColor="#FFAE42", linkHighlightColor="#FFAE42",
-                    displayNodeImage=True, enablePhysics=True , hierarchical=True,
-                    nodeSpacing= 350, treeSpacing =  200, edgeMinimization = False,
-                    direction = "LR", blockShifting = False
+    config = Config(height=contain_height-50, width = "100%",  direction = "RL", directed=False,
+                    #height=350,  width=500,
+                    #directed=True, #fit=True, # edgeMinimization = False,
+                    nodeHighlightColor="#FFAE42", linkHighlightColor="#FFB6C1",
+                    displayNodeImage=True, physics=False,  #hierarchical=True,
+                   # staticGraphWithDragAndDrop=True, 
+                    #nodeSpacing= 350, treeSpacing =  200, edgeMinimization = False,
+                    #direction = "LR", blockShifting = False,
+                   # physics={"enabled": True},  # Stops nodes from moving
+                   # stabilization={"enabled": False}, # Stops centering animation
                     # Example of custom node/edge properties (adjust as needed)
                     # node_stable_colors=True, edge_stable_colors=True
-                    )
+                   )
 #    with graph_window.container(border=True):
     return nodes_agraph, edges_agraph, config
 
@@ -811,150 +810,211 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-
-
-user_window = st.empty()
-schema_col, user_col = st.columns([3, 2])
-
-with schema_col:
-    show_schema, schema_table = st.tabs(["Visualize Schema", "Schema as Table"])
-            
-    with show_schema:
-        nodes_agraph, edges_agraph, config = make_schema(st.session_state.node_df, st.session_state.final_df_edge)
-        agraph(nodes_agraph, edges_agraph, config)
-
-    with schema_table:
-        st.dataframe(st.session_state.final_df_edge[["child", "label", "parent"]])
-
-with user_col:
-    user_input, cypher_output = st.tabs(["User Query", "Cypher Code"])
-    summary_tab = st.tabs(["Results"])[0]
+if "tabs" not in st.session_state:
+    st.session_state["tabs"] = ["Visualize Schema", "Schema as Table"]
     
-    with user_input:
-        user_query = st.text_area(
-            "🔍 Enter your query:",
-            placeholder="e.g., count of all participants",
-            height=80,
-            key="user_query_input"
-        )
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            submit_button = st.button("🚀 Run Query", type="primary", use_container_width=True)
-        with col2:
-            clear_button = st.button("🗑️ Clear", use_container_width=True)
-        
-        if clear_button:
-            st.rerun()
-        
-    if user_query:
-        print(user_query)
-            
-    if submit_button and user_query:
-        st.divider()
-        st.session_state.cypher_str = ""
-        st.session_state.response = {}
-        st.session_state.model_runs = {}
-        st.session_state.judge_decision = {}
-        st.session_state.result_summary = ""
-        st.session_state.last_summary_query = ""
-        st.session_state.last_user_query = user_query
-        judge_timing_rows = []
-        try:
-            st.session_state.model_runs = run_generation_models(user_query)
-            st.session_state.judge_decision = judge_best_cypher(user_query, st.session_state.model_runs)
-            judge_timing_rows.append({
-                "step": "best_cypher_selection",
-                "elapsed_seconds": st.session_state.judge_decision.get("elapsed_seconds", 0.0),
-            })
-
-            selected_cypher = st.session_state.judge_decision.get("selected_cypher", "")
-
-            # Schema validation pass — judge reviews its own selection against actual schema
-            if selected_cypher:
-                validated_cypher, validation_notes, validation_elapsed = validate_cypher_against_schema(selected_cypher, user_query)
-                judge_timing_rows.append({
-                    "step": "schema_validation",
-                    "elapsed_seconds": validation_elapsed,
-                })
-            else:
-                validated_cypher, validation_notes = "", "No Cypher to validate."
-
-            st.session_state.judge_decision["validated_cypher"] = validated_cypher
-            st.session_state.judge_decision["validation_notes"] = validation_notes
-
-            # Execution-feedback repair loop — EXPLAIN against live DB, repair on failure
-            repair_log = []
-            working_cypher = validated_cypher
-            if working_cypher:
-                for attempt in range(1, MAX_REPAIR_ATTEMPTS + 1):
-                    ok, error_msg = explain_cypher(working_cypher)
-                    if ok:
-                        repair_log.append({"attempt": attempt, "status": "✅ EXPLAIN passed", "notes": ""})
-                        break
-                    repaired, notes, repair_elapsed = repair_cypher_with_feedback(working_cypher, user_query, error_msg, attempt)
-                    judge_timing_rows.append({
-                        "step": f"repair_attempt_{attempt}",
-                        "elapsed_seconds": repair_elapsed,
-                    })
-                    repair_log.append({"attempt": attempt, "status": f"❌ EXPLAIN failed", "notes": f"{error_msg[:120]} → {notes}"})
-                    working_cypher = repaired
-                else:
-                    # Final EXPLAIN after last repair attempt
-                    ok, error_msg = explain_cypher(working_cypher)
-                    if not ok:
-                        repair_log.append({"attempt": MAX_REPAIR_ATTEMPTS + 1, "status": "⚠️ Could not fix after max attempts", "notes": error_msg[:120]})
-
-            st.session_state.judge_decision["repair_log"] = repair_log
-            st.session_state.judge_decision["judge_timing_rows"] = judge_timing_rows
-            final_blocked_keywords = find_mutating_keywords(working_cypher)
-            if final_blocked_keywords:
-                st.session_state.cypher_str = ""
-                st.session_state.judge_decision["reason"] = (
-                    f"Rejected unsafe query. Blocked keywords: {', '.join(final_blocked_keywords)}"
-                )
-                st.error(f"Blocked query from execution due to mutating keywords: {', '.join(final_blocked_keywords)}")
-            else:
-                st.session_state.cypher_str = working_cypher
-
-            selected_model = st.session_state.judge_decision.get("selected_model", "")
-            if selected_model and selected_model in st.session_state.model_runs:
-                st.session_state.response = st.session_state.model_runs[selected_model].get("response", {})
-
-            if st.session_state.cypher_str:
-                passed = any("passed" in r["status"] for r in repair_log)
-                label = "✅ Query generated, validated, and EXPLAIN-verified." if passed else "✅ Query generated and validated (EXPLAIN unavailable)."
-                st.success(label)
-            else:
-                st.warning("No Cypher query was generated by the configured models.")
-
-        except Exception as e:
-            st.error(f"❌ Query failed: {e}")
-            extracted_from_error = extract_cypher(str(e))
-            if extracted_from_error:
-                st.session_state.cypher_str = extracted_from_error
-                st.warning("Cypher was extracted from an error path and is shown in the Cypher Code tab.")
-            if "CERTIFICATE_VERIFY_FAILED" in str(e):
-                st.info("xAI TLS verification failed in this environment. Set AIX_INSECURE_SSL=true for local testing.")
-            
+if "dataframe_list" not in st.session_state:
+    st.session_state.dataframe_list = []
     
-    with cypher_output:
+if "df_list" not in st.session_state:
+    st.session_state.df_list = []
 
-        if st.session_state.cypher_str != "":
-            st.write(st.session_state.cypher_str)
+def get_user_nodes():
+    select_list = []
+    match_qry = ""
+    full_prop_str = ""
+    new_cypher = ""
+    for curr_selection in st.session_state.df_list:
+        if len(curr_selection["selection"]["selection"]["rows"]) > 0:  #something was selected
+            rows_clicked = curr_selection["selection"]["selection"]["rows"]
+            rows_selected = curr_selection["dataframe"].iloc[rows_clicked]
+            
+            node_selected = curr_selection["Node_name"]
+            match_qry += f"Match({node_selected}:{node_selected}) \n"
+            
+            properties = rows_selected["Property_Name"].to_list()
+            prop_str = [f"{node_selected}.{i}" for i in properties]
+            full_prop_str = full_prop_str +  ", ".join(prop_str) + ", "
+            select_list.append({node_selected: properties})
+    
+        new_cypher = match_qry + "\n" + "Return " + full_prop_str
+    return select_list, new_cypher
 
-            pattern = r"([a-z]{1}:[a-z]+)"
-            matches = re.findall(pattern, st.session_state.cypher_str)
-            node_names = [i[2:] for i in matches]
+with st.container(height=400, border=True):
 
-            if node_names:
-                x = st.session_state.node_df.query(f"label in {node_names}")
-                st.session_state.node_df.loc[x.index, "color"] = "#00FF00"
-        else:
-            st.write("no cypher statement was created")
+    schema_col, user_col = st.columns([3, 2])
+    with schema_col:
+        tab_list = st.tabs(st.session_state["tabs"])
                 
+        with tab_list[0]:
+            text_col, button_col = st.columns([.65, .35], border=True)
+            with text_col:
+                st.write("Click on a Node to get its properties (opens in new tab)")
+            with button_col:
+                if st.button("Close Data Tabs"):
+                    st.session_state["tabs"] = ["Visualize Schema", "Schema as Table"]
+                    st.session_state.dataframe_list = []
+                    st.session_state.df_list = []
+                    st.rerun()
+                    
+            with st.container(height=300, border=True, vertical_alignment="center"):
+            
+                nodes_agraph, edges_agraph, config = make_schema(st.session_state.node_df, st.session_state.final_df_edge, 300)
+                node_clicked = agraph(nodes_agraph, edges_agraph, config) 
+             
+                if node_clicked:
+                    curr_df = st.session_state.node_df.query(f"index == '{node_clicked}'")
+                    node_name = curr_df["label"].to_list()[0]
+                    if node_name not in st.session_state["tabs"]:
+                        st.session_state["tabs"].append(node_name)  # add name as new tab
+                        st.session_state.dataframe_list.append(curr_df)  #add df to list
+                        st.rerun()  #refresh the page      
+    
+        with tab_list[1]:
+            st.dataframe(st.session_state.final_df_edge[["child", "label", "parent"]])
+        
+        if(len(tab_list) > 2):
+            for curr_tab in range(2,len(tab_list)):
+                with tab_list[curr_tab]:
+                    curr_df = st.session_state.dataframe_list[curr_tab-2]
+                    
+                    node_name = curr_df["label"].to_list()[0]
+                    properties = curr_df["properties"].values[0] #.to_list()[0]             
+                    prop_df = pd.DataFrame.from_dict(properties, orient='index') #, columns=['Property', 'Example Value'])
+                    prop_df = prop_df.reset_index()
+                    prop_df.columns = ["Property_Name", "Example_Value"]
+    
+                    st.write(f"You clicked on node: **{node_name}**")
+                    st.session_state.df_list = [i for i in st.session_state.df_list if node_name not in i["Node_name"]]
+                    
+                    st.session_state.df_list.append({"Node_name": node_name, "dataframe": prop_df, 
+                                                     "selection": st.dataframe(prop_df, on_select="rerun", selection_mode="multi-row")})
+                        
+    with user_col:
+        user_input, cypher_output, user_cypher = st.tabs(["User Query", "Cypher Code", "User Created Cypher"])
+#        summary_tab = st.tabs(["Results"])[0]
+        
+        with user_input:
+            user_query = st.text_area(
+                "🔍 Enter your query:",
+                placeholder="e.g., count of all participants",
+                height=80,
+                key="user_query_input"
+            )
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                submit_button = st.button("🚀 Run Query", type="primary", use_container_width=True)
+            with col2:
+                clear_button = st.button("🗑️ Clear", use_container_width=True)
+            
+            if clear_button:
+                st.rerun()
+
+        if submit_button and user_query:
+            st.divider()
+            st.session_state.cypher_str = ""
+            st.session_state.response = {}
+            st.session_state.model_runs = {}
+            st.session_state.judge_decision = {}
+            st.session_state.result_summary = ""
+            st.session_state.last_summary_query = ""
+            st.session_state.last_user_query = user_query
+            judge_timing_rows = []
+            try:
+                st.session_state.model_runs = run_generation_models(user_query)
+                st.session_state.judge_decision = judge_best_cypher(user_query, st.session_state.model_runs)
+                judge_timing_rows.append({
+                    "step": "best_cypher_selection",
+                    "elapsed_seconds": st.session_state.judge_decision.get("elapsed_seconds", 0.0),
+                })
+    
+                selected_cypher = st.session_state.judge_decision.get("selected_cypher", "")
+    
+                # Schema validation pass — judge reviews its own selection against actual schema
+                if selected_cypher:
+                    validated_cypher, validation_notes, validation_elapsed = validate_cypher_against_schema(selected_cypher, user_query)
+                    judge_timing_rows.append({
+                        "step": "schema_validation",
+                        "elapsed_seconds": validation_elapsed,
+                    })
+                else:
+                    validated_cypher, validation_notes = "", "No Cypher to validate."
+    
+                st.session_state.judge_decision["validated_cypher"] = validated_cypher
+                st.session_state.judge_decision["validation_notes"] = validation_notes
+    
+                # Execution-feedback repair loop — EXPLAIN against live DB, repair on failure
+                repair_log = []
+                working_cypher = validated_cypher
+                if working_cypher:
+                    for attempt in range(1, MAX_REPAIR_ATTEMPTS + 1):
+                        ok, error_msg = explain_cypher(working_cypher)
+                        if ok:
+                            repair_log.append({"attempt": attempt, "status": "✅ EXPLAIN passed", "notes": ""})
+                            break
+                        repaired, notes, repair_elapsed = repair_cypher_with_feedback(working_cypher, user_query, error_msg, attempt)
+                        judge_timing_rows.append({
+                            "step": f"repair_attempt_{attempt}",
+                            "elapsed_seconds": repair_elapsed,
+                        })
+                        repair_log.append({"attempt": attempt, "status": "❌ EXPLAIN failed", "notes": f"{error_msg[:120]} → {notes}"})
+                        working_cypher = repaired
+                    else:
+                        # Final EXPLAIN after last repair attempt
+                        ok, error_msg = explain_cypher(working_cypher)
+                        if not ok:
+                            repair_log.append({"attempt": MAX_REPAIR_ATTEMPTS + 1, "status": "⚠️ Could not fix after max attempts", "notes": error_msg[:120]})
+    
+                st.session_state.judge_decision["repair_log"] = repair_log
+                st.session_state.judge_decision["judge_timing_rows"] = judge_timing_rows
+                st.session_state.cypher_str = working_cypher
+    
+                selected_model = st.session_state.judge_decision.get("selected_model", "")
+                if selected_model and selected_model in st.session_state.model_runs:
+                    st.session_state.response = st.session_state.model_runs[selected_model].get("response", {})
+    
+                if st.session_state.cypher_str:
+                    passed = any("passed" in r["status"] for r in repair_log)
+                    label = "✅ Query generated, validated, and EXPLAIN-verified." if passed else "✅ Query generated and validated (EXPLAIN unavailable)."
+                    st.success(label)
+                else:
+                    st.warning("No Cypher query was generated by the configured models.")
+    
+            except Exception as e:
+                st.error(f"❌ Query failed: {e}")
+                extracted_from_error = extract_cypher(str(e))
+                if extracted_from_error:
+                    st.session_state.cypher_str = extracted_from_error
+                    st.warning("Cypher was extracted from an error path and is shown in the Cypher Code tab.")
+                if "CERTIFICATE_VERIFY_FAILED" in str(e):
+                    st.info("xAI TLS verification failed in this environment. Set AIX_INSECURE_SSL=true for local testing.")    
+            
+        with cypher_output:
+    
+            if st.session_state.cypher_str != "":
+                st.write(st.session_state.cypher_str)
+    
+                pattern = r"([a-z]{1}:[a-z]+)"
+                matches = re.findall(pattern, st.session_state.cypher_str)
+                node_names = [i[i.find(":")+1:] for i in matches]
+    
+                if node_names:
+                    x = st.session_state.node_df.query(f"label in {node_names}")
+                    st.session_state.node_df.loc[x.index, "color"] = "#00FF00"
+        
+        with user_cypher:
+            select_list, new_cypher = get_user_nodes()
+            if len(select_list) == 0:
+                st.write("no cypher statement was created")
+            else:
+                st.write(new_cypher)
+            #    st.session_state.user_cypher_str = new_cypher[:-2]
+                    
+with st.container(height=400, border=True):
+    summary_tab, ai_tab, table_tab = st.tabs(["Model Preformance", "AI interpretation", "Table Results"])
     with summary_tab:
-        st.write("Summary")
+        #st.write("Summary")
 
         if st.session_state.model_runs:
             run_rows = []
@@ -967,25 +1027,20 @@ with user_col:
                     "error": run_data.get("error", "")[:140],
                 })
             st.write("Model generation runs")
-            st.dataframe(pd.DataFrame(run_rows), use_container_width=True)
+            st.dataframe(pd.DataFrame(run_rows)) #, width=True)
 
         if st.session_state.judge_decision:
             with st.container(border=True):
                 st.write("Judge selection")
                 st.write(f"Selected model: {st.session_state.judge_decision.get('selected_model', 'n/a')}")
                 st.write(st.session_state.judge_decision.get("reason", ""))
-                st.write(f"Selection runtime: {st.session_state.judge_decision.get('elapsed_seconds', 0)}s")
                 validation_notes = st.session_state.judge_decision.get("validation_notes", "")
                 if validation_notes:
                     st.write(f"Schema validation: {validation_notes}")
-                judge_timing_rows = st.session_state.judge_decision.get("judge_timing_rows", [])
-                if judge_timing_rows:
-                    st.write("Judge model runtimes")
-                    st.dataframe(pd.DataFrame(judge_timing_rows), use_container_width=True)
                 repair_log = st.session_state.judge_decision.get("repair_log", [])
                 if repair_log:
                     st.write("EXPLAIN repair log")
-                    st.dataframe(pd.DataFrame(repair_log), use_container_width=True)
+                    st.dataframe(pd.DataFrame(repair_log), width=True)
 
         if st.session_state.cypher_str != "":
             try:
@@ -996,11 +1051,11 @@ with user_col:
                 st.session_state.mem_db.cursor.execute(query)
                 result = st.session_state.mem_db.cursor.fetchall()
                 columns = [desc.name for desc in st.session_state.mem_db.cursor.description]
-                df = pd.DataFrame(result, columns=columns)
+                st.session_state.df = pd.DataFrame(result, columns=columns)
 
                 if st.session_state.last_summary_query != query:
                     st.session_state.result_summary = summarize_result_table(
-                        df=df,
+                        df=st.session_state.df,
                         user_question=st.session_state.last_user_query,
                         cypher_query=query,
                     )
@@ -1008,23 +1063,23 @@ with user_col:
             except Exception as e:
                 st.error(f"Cypher execution error: {e}")
                 st.session_state.result_summary = f"Could not interpret results because query execution failed: {e}"
-                df = pd.DataFrame()
+                st.session_state.df = pd.DataFrame()
         else:
-            df = pd.DataFrame()
+            st.session_state.df = pd.DataFrame()
 
-        with st.container(border=True):
+        with ai_tab: #st.container(border=True):
             st.write("AI interpretation of result table")
             if st.session_state.result_summary:
                 st.write(st.session_state.result_summary)
             else:
                 st.write("Run a query to generate a summary from the Result Table.")
 
-        st.write("Result Table")
-        with st.container(border=True):
-            if not df.empty:
-                st.dataframe(df, use_container_width=True)
+        with table_tab:
+            st.write("Result Table")
+     #   with st.container(border=True):
+            if not st.session_state.df.empty:
+                st.dataframe(st.session_state.df) #, width=True)
             else:
                 st.write("no data to display")
-                
-            
-                      
+
+   
