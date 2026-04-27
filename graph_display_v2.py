@@ -14,11 +14,28 @@ import json
 import httpx
 import time
 import sys
+from datetime import date, datetime
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from streamlit_agraph import agraph, Node, Edge, Config
 from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+
+try:
+    from langchain_aws import ChatBedrockConverse  # type: ignore
+except Exception:
+    ChatBedrockConverse = None
+
+try:
+    import boto3  # type: ignore
+except Exception:
+    boto3 = None
+
+try:
+    import pyarrow as pa  # type: ignore
+except Exception:
+    pa = None
 
 from langchain_memgraph.graphs.memgraph import MemgraphLangChain
 from langchain_memgraph.toolkits import MemgraphToolkit
@@ -39,11 +56,416 @@ if config_path.is_file():
     with open(config_path, "r", encoding="utf-8") as f:
         config_data = toml.load(f)
 
+
+AIX_API_BASE_URL = "https://api.x.ai/v1"
+AIX_INSECURE_SSL = os.getenv("AIX_INSECURE_SSL", "false").lower() == "true"
+ANTHROPIC_API_BASE_URL = os.getenv("ANTHROPIC_API_BASE_URL", "https://api.anthropic.com")
+BEDROCK_DEFAULT_REGION = os.getenv("BEDROCK_REGION", "us-east-1")
+
+
+def parse_api_key_entry(raw_key: str):
+    """Infer provider from key format and normalize credentials payload."""
+    key = (raw_key or "").strip()
+    if not key:
+        return None, "API key is empty."
+
+    if key.startswith("xai-"):
+        return {
+            "provider": "xai",
+            "api_key": key,
+            "provider_label": "xAI",
+        }, ""
+
+    if key.startswith("sk-ant-"):
+        return {
+            "provider": "anthropic",
+            "api_key": key,
+            "provider_label": "Anthropic",
+        }, ""
+
+    # Bedrock format (single textbox): ACCESS_KEY_ID:SECRET_ACCESS_KEY[:REGION]
+    parts = key.split(":")
+    if len(parts) in (2, 3) and re.match(r"^(AKIA|ASIA)[A-Z0-9]{16}$", parts[0] or ""):
+        region = parts[2].strip() if len(parts) == 3 and parts[2].strip() else BEDROCK_DEFAULT_REGION
+        return {
+            "provider": "bedrock",
+            "provider_label": "AWS Bedrock",
+            "aws_access_key_id": parts[0].strip(),
+            "aws_secret_access_key": parts[1].strip(),
+            "region": region,
+            "api_key": key,
+        }, ""
+
+    return None, (
+        "Could not infer provider from key format. Use xAI keys starting with 'xai-', "
+        "Anthropic keys starting with 'sk-ant-', or Bedrock as ACCESS:SECRET[:REGION]."
+    )
+
+
+def list_xai_models(api_key: str):
+    headers = {"Authorization": f"Bearer {api_key}"}
+    with httpx.Client(timeout=20.0, verify=not AIX_INSECURE_SSL) as client:
+        resp = client.get(f"{AIX_API_BASE_URL}/models", headers=headers)
+        resp.raise_for_status()
+        payload = resp.json()
+    models = []
+    for item in payload.get("data", []):
+        model_id = item.get("id", "").strip()
+        if model_id:
+            models.append(model_id)
+    return sorted(set(models))
+
+
+def list_anthropic_models(api_key: str):
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+    }
+    with httpx.Client(timeout=20.0, verify=not AIX_INSECURE_SSL) as client:
+        resp = client.get(f"{ANTHROPIC_API_BASE_URL}/v1/models", headers=headers)
+        resp.raise_for_status()
+        payload = resp.json()
+    models = []
+    for item in payload.get("data", []):
+        model_id = item.get("id", "").strip()
+        if model_id:
+            models.append(model_id)
+    return sorted(set(models))
+
+
+def list_bedrock_models(access_key: str, secret_key: str, region: str):
+    if boto3 is None:
+        raise RuntimeError("boto3 is not installed. Add boto3 to requirements.")
+    client = boto3.client(
+        "bedrock",
+        region_name=region,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+    )
+    resp = client.list_foundation_models(byOutputModality="TEXT")
+    models = []
+    for item in resp.get("modelSummaries", []):
+        model_id = (item.get("modelId") or "").strip()
+        if model_id:
+            models.append(model_id)
+    return sorted(set(models))
+
+
+def discover_models_for_key(key_entry: dict):
+    provider = key_entry.get("provider")
+    if provider == "xai":
+        return list_xai_models(key_entry["api_key"])
+    if provider == "anthropic":
+        return list_anthropic_models(key_entry["api_key"])
+    if provider == "bedrock":
+        return list_bedrock_models(
+            key_entry["aws_access_key_id"],
+            key_entry["aws_secret_access_key"],
+            key_entry["region"],
+        )
+    raise ValueError(f"Unsupported provider: {provider}")
+
+
+def get_model_entry(model_selector):
+    if isinstance(model_selector, dict):
+        return model_selector
+    if not isinstance(model_selector, str):
+        return None
+    registry = st.session_state.get("model_registry", {})
+    return registry.get(model_selector)
+
+
+def get_model_label(model_selector):
+    entry = get_model_entry(model_selector)
+    if not entry:
+        return str(model_selector)
+    return entry.get("label", str(model_selector))
+
+
+def build_chat_model(model_selector):
+    entry = get_model_entry(model_selector)
+    if not entry:
+        raise ValueError(f"Unknown model selection: {model_selector}")
+
+    provider = entry["provider"]
+    if provider == "xai":
+        return ChatOpenAI(
+            model=entry["model_id"],
+            api_key=entry["api_key"],
+            base_url=AIX_API_BASE_URL,
+            temperature=0,
+            http_client=httpx.Client(verify=not AIX_INSECURE_SSL),
+        )
+
+    if provider == "anthropic":
+        return ChatAnthropic(
+            model=entry["model_id"],
+            anthropic_api_key=entry["api_key"],
+            temperature=0,
+        )
+
+    if provider == "bedrock":
+        if ChatBedrockConverse is None:
+            raise RuntimeError("langchain-aws is not installed. Add langchain-aws to requirements.")
+        return ChatBedrockConverse(
+            model_id=entry["model_id"],
+            region_name=entry["region"],
+            aws_access_key_id=entry["aws_access_key_id"],
+            aws_secret_access_key=entry["aws_secret_access_key"],
+            temperature=0,
+        )
+
+    raise ValueError(f"Unsupported provider: {provider}")
+
 # Streamlit Page Configuration
 # --- Streamlit UI ---
 
-st.set_page_config(layout="wide")
 st.set_page_config(page_title="Memgraph AI Query Interface", page_icon="🧠", layout="wide")
+
+# ── Login Gate ──────────────────────────────────────────────────────────────
+if not st.session_state.get("db_connected", False):
+    st.markdown(
+        "<h1 style='text-align:center;font-size:28px;'>🧠 Memgraph AI Query Interface</h1>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<p style='text-align:center;color:gray;'>Connect to your Memgraph database to continue</p>",
+        unsafe_allow_html=True,
+    )
+    st.divider()
+    _, col_login, _ = st.columns([1, 2, 1])
+    with col_login:
+        with st.form("login_form"):
+            st.subheader("Database Connection")
+            _default_host = config_data.get("Memgraph_Creds", {}).get("MEM_HOST", os.getenv("MEMGRAPH_HOST", "127.0.0.1"))
+            _default_port = int(config_data.get("Memgraph_Creds", {}).get("MEM_PORT", os.getenv("MEMGRAPH_PORT", "7687")))
+            _default_user = config_data.get("Memgraph_Creds", {}).get("MEM_USER", os.getenv("MEMGRAPH_USER", ""))
+            host_input = st.text_input("Host", value=_default_host, placeholder="127.0.0.1")
+            port_input = st.number_input("Port", value=_default_port, min_value=1, max_value=65535, step=1)
+            user_input_login = st.text_input("Username", value=_default_user, placeholder="(leave blank if none)")
+            pass_input_login = st.text_input("Password", type="password", placeholder="(leave blank if none)")
+            submitted = st.form_submit_button("Connect", use_container_width=True, type="primary")
+
+        if submitted:
+            try:
+                _test = mgclient.connect(
+                    host=host_input,
+                    port=int(port_input),
+                    username=user_input_login,
+                    password=pass_input_login,
+                )
+                _test.cursor().close()
+                st.session_state.db_connected = True
+                st.session_state.login_host = host_input
+                st.session_state.login_port = int(port_input)
+                st.session_state.login_user = user_input_login
+                st.session_state.login_pass = pass_input_login
+                st.rerun()
+            except Exception as _e:
+                st.error(f"❌ Connection failed: {_e}")
+    st.stop()
+# ────────────────────────────────────────────────────────────────────────────
+
+
+# ── Model + API Key Configuration Gate ─────────────────────────────────────
+if "api_key_inputs" not in st.session_state:
+    default_xai = config_data.get("API_Key", {}).get("AIX_API_KEY", "").strip()
+    st.session_state.api_key_inputs = [default_xai] if default_xai else [""]
+
+if "generator_slots" not in st.session_state:
+    st.session_state.generator_slots = 1
+
+if "generator_selected" not in st.session_state:
+    st.session_state.generator_selected = [""]
+
+if "judge_selected" not in st.session_state:
+    st.session_state.judge_selected = ""
+
+if "interpreter_selected" not in st.session_state:
+    st.session_state.interpreter_selected = ""
+
+if "model_registry" not in st.session_state:
+    st.session_state.model_registry = {}
+
+if "model_option_ids" not in st.session_state:
+    st.session_state.model_option_ids = []
+
+if "model_discovery_errors" not in st.session_state:
+    st.session_state.model_discovery_errors = []
+
+if not st.session_state.get("model_configured", False):
+    st.markdown("<h1 style='text-align:center;font-size:28px;'>Model Configuration</h1>", unsafe_allow_html=True)
+    st.markdown(
+        "<p style='text-align:center;color:gray;'>Add one or two API keys, load available models, then choose generator and judge models.</p>",
+        unsafe_allow_html=True,
+    )
+    st.info(
+        "Key formats: xAI starts with xai-, Anthropic starts with sk-ant-, "
+        "Bedrock uses ACCESS_KEY_ID:SECRET_ACCESS_KEY[:REGION]."
+    )
+
+    st.subheader("1) API Keys")
+    key_cols = st.columns([10, 2])
+    with key_cols[0]:
+        st.session_state.api_key_inputs[0] = st.text_input(
+            "API Key 1",
+            value=st.session_state.api_key_inputs[0],
+            type="password",
+            key="api_key_input_0",
+        )
+    with key_cols[1]:
+        if len(st.session_state.api_key_inputs) < 2:
+            if st.button("+", key="add_api_key", use_container_width=True):
+                st.session_state.api_key_inputs.append("")
+                st.rerun()
+
+    if len(st.session_state.api_key_inputs) > 1:
+        key2_cols = st.columns([10, 2])
+        with key2_cols[0]:
+            st.session_state.api_key_inputs[1] = st.text_input(
+                "API Key 2",
+                value=st.session_state.api_key_inputs[1],
+                type="password",
+                key="api_key_input_1",
+            )
+        with key2_cols[1]:
+            if st.button("-", key="remove_api_key", use_container_width=True):
+                st.session_state.api_key_inputs = st.session_state.api_key_inputs[:1]
+                st.session_state.model_registry = {}
+                st.session_state.model_option_ids = []
+                st.session_state.generator_selected = [""]
+                st.session_state.judge_selected = ""
+                st.session_state.interpreter_selected = ""
+                st.rerun()
+
+    if st.button("Load Models From Keys", type="primary", use_container_width=True):
+        model_registry = {}
+        option_ids = []
+        discovery_errors = []
+
+        for idx, raw_key in enumerate(st.session_state.api_key_inputs):
+            key_entry, parse_error = parse_api_key_entry(raw_key)
+            if parse_error:
+                discovery_errors.append(f"Key {idx + 1}: {parse_error}")
+                continue
+            try:
+                discovered = discover_models_for_key(key_entry)
+                if not discovered:
+                    discovery_errors.append(
+                        f"Key {idx + 1} ({key_entry['provider_label']}): no models returned."
+                    )
+                    continue
+                for model_id in discovered:
+                    option_id = f"{key_entry['provider']}::{idx}::{model_id}"
+                    label = f"{model_id} [{key_entry['provider_label']} | key {idx + 1}]"
+                    model_registry[option_id] = {
+                        **key_entry,
+                        "model_id": model_id,
+                        "option_id": option_id,
+                        "label": label,
+                        "key_index": idx,
+                    }
+                    option_ids.append(option_id)
+            except Exception as e:
+                discovery_errors.append(
+                    f"Key {idx + 1} ({key_entry['provider_label']}): model discovery failed: {e}"
+                )
+
+        st.session_state.model_registry = model_registry
+        st.session_state.model_option_ids = sorted(option_ids)
+        st.session_state.model_discovery_errors = discovery_errors
+
+        if st.session_state.model_option_ids:
+            st.success(f"Loaded {len(st.session_state.model_option_ids)} model options.")
+        if discovery_errors:
+            for err in discovery_errors:
+                st.warning(err)
+
+    if st.session_state.model_discovery_errors:
+        for err in st.session_state.model_discovery_errors:
+            st.warning(err)
+
+    if st.session_state.model_option_ids:
+        st.subheader("2) Generator Models (max 5)")
+        btn_cols = st.columns([1, 1, 8])
+        with btn_cols[0]:
+            if st.button("+", key="add_generator_slot", use_container_width=True):
+                if st.session_state.generator_slots < 5:
+                    st.session_state.generator_slots += 1
+                    st.session_state.generator_selected.append("")
+                    st.rerun()
+        with btn_cols[1]:
+            if st.button("-", key="remove_generator_slot", use_container_width=True):
+                if st.session_state.generator_slots > 1:
+                    st.session_state.generator_slots -= 1
+                    st.session_state.generator_selected = st.session_state.generator_selected[:-1]
+                    st.rerun()
+
+        while len(st.session_state.generator_selected) < st.session_state.generator_slots:
+            st.session_state.generator_selected.append("")
+
+        options = [""] + st.session_state.model_option_ids
+        for i in range(st.session_state.generator_slots):
+            key_name = f"generator_model_{i}"
+            current = st.session_state.generator_selected[i] if i < len(st.session_state.generator_selected) else ""
+            if current not in options:
+                current = ""
+            selected = st.selectbox(
+                f"Generator Model {i + 1}",
+                options=options,
+                index=options.index(current),
+                key=key_name,
+                format_func=lambda x: "Select a model" if x == "" else get_model_label(x),
+            )
+            st.session_state.generator_selected[i] = selected
+
+        st.subheader("3) Judge Model")
+        judge_options = [""] + st.session_state.model_option_ids
+        curr_judge = st.session_state.judge_selected if st.session_state.judge_selected in judge_options else ""
+        st.session_state.judge_selected = st.selectbox(
+            "Judge Model",
+            options=judge_options,
+            index=judge_options.index(curr_judge),
+            key="judge_model_selector",
+            format_func=lambda x: "Select a model" if x == "" else get_model_label(x),
+        )
+
+        st.subheader("4) Interpreter Model")
+        interpreter_options = [""] + st.session_state.model_option_ids
+        curr_interpreter = (
+            st.session_state.interpreter_selected
+            if st.session_state.interpreter_selected in interpreter_options
+            else ""
+        )
+        st.session_state.interpreter_selected = st.selectbox(
+            "Interpreter Model",
+            options=interpreter_options,
+            index=interpreter_options.index(curr_interpreter),
+            key="interpreter_model_selector",
+            format_func=lambda x: "Select a model" if x == "" else get_model_label(x),
+        )
+
+        generators_ready = all(bool(x) for x in st.session_state.generator_selected[:st.session_state.generator_slots])
+        judge_ready = bool(st.session_state.judge_selected)
+        interpreter_ready = bool(st.session_state.interpreter_selected)
+
+        if st.button(
+            "Continue To Query Page",
+            type="primary",
+            use_container_width=True,
+            disabled=not (generators_ready and judge_ready and interpreter_ready),
+        ):
+            st.session_state.generation_models = st.session_state.generator_selected[:st.session_state.generator_slots]
+            st.session_state.judge_model_name = st.session_state.judge_selected
+            st.session_state.interpreter_model_name = st.session_state.interpreter_selected
+            st.session_state.model_configured = True
+            st.session_state.agent_executors = {}
+            st.rerun()
+    else:
+        st.info("Load models first to enable generator and judge model selection.")
+
+    st.stop()
+# ────────────────────────────────────────────────────────────────────────────
 
 title_alignment = """
     <style>
@@ -80,51 +502,18 @@ st.markdown("<h1 class='no-space' style='text-align: center; color: black; font-
             "<p class='no-space' style='text-align: center; color: black; font-size: 15px;'>Ask questions about your graph database using natural language</p>",
              unsafe_allow_html=True)
 
-# xAI API configuration
-AIX_API_KEY = ""
-AIX_API_BASE_URL =  "https://api.x.ai/v1"
-AIX_MODELS = [
-    m.strip() for m in os.getenv(
-        "AIX_MODELS",
-        "grok-4-fast,grok-3-mini-fast"
-    ).split(",") if m.strip()
-]
-AIX_JUDGE_MODEL = os.getenv("AIX_JUDGE_MODEL", "grok-4.20-beta-0309-reasoning")
-AIX_INSECURE_SSL = os.getenv("AIX_INSECURE_SSL", "false").lower() == "true"
-
-AIX_API_KEY = config_data.get("API_Key", {}).get("AIX_API_KEY", os.getenv("AIX_API_KEY", ""))
-
 MEMGRAPH_HOST = config_data.get("Memgraph_Creds", {}).get("MEM_HOST", os.getenv("MEMGRAPH_HOST", "127.0.0.1"))
 MEMGRAPH_PORT = int(config_data.get("Memgraph_Creds", {}).get("MEM_PORT", os.getenv("MEMGRAPH_PORT", "7687")))
 
 MEMGRAPH_USER = config_data.get("Memgraph_Creds", {}).get("MEM_USER", os.getenv("MEMGRAPH_USER", ""))
 MEMGRAPH_PASS = config_data.get("Memgraph_Creds", {}).get("MEM_PASS", os.getenv("MEMGRAPH_PASS", ""))
 
-
-if not AIX_API_KEY:
-    st.error("Missing AIX_API_KEY environment variable.")
-    st.stop()
-
-if len(AIX_MODELS) < 1:
-    st.error("No xAI generation models configured. Set AIX_MODELS.")
-    st.stop()
-
-
-def build_chat_model(model_name):
-    return ChatOpenAI(
-        model=model_name,
-        api_key=AIX_API_KEY,
-        base_url=AIX_API_BASE_URL,
-        temperature=0,
-        http_client=httpx.Client(verify=not AIX_INSECURE_SSL),
-    )
-
 class Memgraph_DB():
     def __init__(self):
-        self.host =  MEMGRAPH_HOST
-        self.port =   MEMGRAPH_PORT
-        self.username = MEMGRAPH_USER
-        self.password = MEMGRAPH_PASS
+        self.host = st.session_state.get("login_host", MEMGRAPH_HOST)
+        self.port = st.session_state.get("login_port", MEMGRAPH_PORT)
+        self.username = st.session_state.get("login_user", MEMGRAPH_USER)
+        self.password = st.session_state.get("login_pass", MEMGRAPH_PASS)
     def connect_to_db(self): 
         self.conn = mgclient.connect(host=self.host, port=self.port, username=self.username, password=self.password)
         self.cursor = self.conn.cursor()
@@ -147,8 +536,8 @@ if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame()
 
 if st.session_state.mem_db is None:
-    host = st.session_state.mem_db.host
-    port = st.session_state.mem_db.port
+    host = st.session_state.get("login_host", MEMGRAPH_HOST)
+    port = st.session_state.get("login_port", MEMGRAPH_PORT)
     st.error(f"Memgraph is not reachable at {host}:{port}.")
     st.info("Start Memgraph first, then refresh this page.")
     st.stop()
@@ -162,7 +551,8 @@ if "db" not in st.session_state:
     )
 
 def get_mem_tools(db):
-    toolkit = MemgraphToolkit(db=db, llm=build_chat_model(AIX_MODELS[0]))
+    default_model = st.session_state.generation_models[0]
+    toolkit = MemgraphToolkit(db=db, llm=build_chat_model(default_model))
     tools = toolkit.get_tools()
     # Keep only run_cypher to avoid no-input tool signature issues with some model/agent combos.
     tools = [tool for tool in tools if tool.name == "run_cypher"]
@@ -204,10 +594,13 @@ if "last_user_query" not in st.session_state:
     st.session_state.last_user_query = ""
 
 if "generation_models" not in st.session_state:
-    st.session_state.generation_models = AIX_MODELS[:3]
+    st.session_state.generation_models = st.session_state.get("generator_selected", [""])
 
 if "judge_model_name" not in st.session_state:
-    st.session_state.judge_model_name = AIX_JUDGE_MODEL
+    st.session_state.judge_model_name = st.session_state.get("judge_selected", "")
+
+if "interpreter_model_name" not in st.session_state:
+    st.session_state.interpreter_model_name = st.session_state.get("interpreter_selected", "")
 
 if "agent_executors" not in st.session_state:
     st.session_state.agent_executors = {}
@@ -271,6 +664,22 @@ def get_property_value_hints():
         st.session_state.property_value_hints = build_node_property_value_hints()
     return st.session_state.property_value_hints
 
+# ── Stage 1: write-keyword guard ─────────────────────────────────────────────
+WRITE_KEYWORDS = [
+    r"\bCREATE\b", r"\bMERGE\b", r"\bSET\b", r"\bDELETE\b", r"\bDETACH\b",
+    r"\bREMOVE\b", r"\bFOREACH\b", r"\bDROP\b", r"\bCALL\s+db\.create",
+    r"\bLOAD\s+CSV\b",
+]
+
+def contains_write_keywords(cypher: str) -> str | None:
+    """Return the first write keyword found, or None if the query is read-only."""
+    for pattern in WRITE_KEYWORDS:
+        m = re.search(pattern, cypher, re.IGNORECASE)
+        if m:
+            return m.group(0)
+    return None
+# ─────────────────────────────────────────────────────────────────────────────
+
 def create_agent(tools, llm, property_value_hints):
     template = '''You are an expert Open-Cypher data specialist who can generate complex queries based on user requirements to answer their questions using Open-Cypher.Answer the following questions as best you can in the form of a Cypher query. You have access to the following tools:
     
@@ -288,6 +697,15 @@ def create_agent(tools, llm, property_value_hints):
     Stop using term and input the exact term asked for in the question when filtering, do not use a placeholder term
 
     {property_value_hints}
+
+    DATABASE WRITE PROTECTION — CRITICAL RULE:
+        You are connected to a READ-ONLY database.  You MUST NOT generate any Cypher
+        that modifies data or schema under any circumstances.  The following keywords
+        are strictly forbidden in your final Cypher output:
+        CREATE, MERGE, SET, DELETE, DETACH DELETE, REMOVE, FOREACH, DROP,
+        CALL db.create*, LOAD CSV.
+        If the user asks you to add, update, delete, or modify data, respond with:
+        "I can only run read queries. Data modification is not permitted."
     
     Cypher Rules:
         when the variable is not a number then use the following filtering format WHERE ANY(term IN [term] WHERE tolower(variable) CONTAINS term) 
@@ -323,33 +741,34 @@ def create_agent(tools, llm, property_value_hints):
                                    return_intermediate_steps=False, tool_choice="auto")
     return agent_executor
 
-def get_or_create_agent_executor(model_name):
-    if model_name not in st.session_state.agent_executors:
-        llm = build_chat_model(model_name)
+def get_or_create_agent_executor(model_selector):
+    if model_selector not in st.session_state.agent_executors:
+        llm = build_chat_model(model_selector)
         property_value_hints = get_property_value_hints()
-        st.session_state.agent_executors[model_name] = create_agent(
+        st.session_state.agent_executors[model_selector] = create_agent(
             st.session_state.tools,
             llm,
             property_value_hints,
         )
-    return st.session_state.agent_executors[model_name]
+    return st.session_state.agent_executors[model_selector]
 
 def run_generation_models(user_query):
-    generation_models = list(st.session_state.generation_models)
+    generation_models = [m for m in list(st.session_state.generation_models) if m]
 
     # Build/cache executors first to avoid session-state races during parallel work.
     executors = {}
-    for model_name in generation_models:
-        executors[model_name] = get_or_create_agent_executor(model_name)
+    for model_selector in generation_models:
+        executors[model_selector] = get_or_create_agent_executor(model_selector)
 
-    def run_single_model(model_name):
+    def run_single_model(model_selector):
         start_time = time.time()
         try:
-            response = executors[model_name].invoke({"input": user_query})
+            response = executors[model_selector].invoke({"input": user_query})
             output_str = response.get("output", "") if isinstance(response, dict) else str(response)
             elapsed = time.time() - start_time
             return {
                 "status": "ok",
+                "label": get_model_label(model_selector),
                 "response": response,
                 "output": output_str,
                 "cypher": extract_cypher(output_str),
@@ -361,6 +780,7 @@ def run_generation_models(user_query):
             error_text = str(e)
             return {
                 "status": "error",
+                "label": get_model_label(model_selector),
                 "response": {},
                 "output": "",
                 "cypher": extract_cypher(error_text),
@@ -372,17 +792,18 @@ def run_generation_models(user_query):
     max_workers = max(1, min(len(generation_models), 8))
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         future_map = {
-            pool.submit(run_single_model, model_name): model_name
-            for model_name in generation_models
+            pool.submit(run_single_model, model_selector): model_selector
+            for model_selector in generation_models
         }
         for future in as_completed(future_map):
-            model_name = future_map[future]
+            model_selector = future_map[future]
             try:
-                unordered_runs[model_name] = future.result()
+                unordered_runs[model_selector] = future.result()
             except Exception as e:
                 error_text = str(e)
-                unordered_runs[model_name] = {
+                unordered_runs[model_selector] = {
                     "status": "error",
+                    "label": get_model_label(model_selector),
                     "response": {},
                     "output": "",
                     "cypher": extract_cypher(error_text),
@@ -390,13 +811,14 @@ def run_generation_models(user_query):
                 }
 
     # Preserve display order configured in generation_models.
-    return {model_name: unordered_runs.get(model_name, {
+    return {model_selector: unordered_runs.get(model_selector, {
         "status": "error",
+        "label": get_model_label(model_selector),
         "response": {},
         "output": "",
         "cypher": "",
         "error": "No result returned.",
-    }) for model_name in generation_models}
+    }) for model_selector in generation_models}
 
 def judge_best_cypher(user_query, model_runs):
     candidates = []
@@ -420,14 +842,50 @@ def judge_best_cypher(user_query, model_runs):
             "elapsed_seconds": 0.0,
         }
 
+    # ── Stage 2: filter out any write queries before sending to the judge ────
+    safe_candidates = []
+    for c in candidates:
+        blocked_kw = contains_write_keywords(c["cypher"])
+        if blocked_kw:
+            # Mark the originating model run as blocked so it shows in the UI
+            if c["model"] in st.session_state.model_runs:
+                st.session_state.model_runs[c["model"]]["status"] = "blocked"
+                st.session_state.model_runs[c["model"]]["error"] = (
+                    f"Stage-2 block: write keyword '{blocked_kw}' detected."
+                )
+        else:
+            safe_candidates.append(c)
+
+    if not safe_candidates:
+        return {
+            "selected_model": "",
+            "selected_cypher": "",
+            "reason": "All candidate queries were blocked by the write-keyword filter (Stage 2).",
+            "elapsed_seconds": 0.0,
+        }
+
+    if len(safe_candidates) == 1:
+        return {
+            "selected_model": safe_candidates[0]["model"],
+            "selected_cypher": safe_candidates[0]["cypher"],
+            "reason": "Only one model produced a read-only Cypher query.",
+            "elapsed_seconds": 0.0,
+        }
+    # ─────────────────────────────────────────────────────────────────────────
+
     judge_prompt = f"""
-You are a Cypher judge. Choose the best query for the user's question.
+You are a Cypher judge for a READ-ONLY database. Choose the best query for the user's question.
+
+SECURITY RULE: If any candidate contains write/edit keywords (CREATE, MERGE, SET,
+DELETE, DETACH, REMOVE, FOREACH, DROP, CALL db.create*, LOAD CSV), you MUST reject
+it by selecting a different candidate. If all candidates are write queries, set
+selected_model and selected_cypher to empty strings and explain in reason.
 
 Question:
 {user_query}
 
 Candidates:
-{json.dumps(candidates, indent=2)}
+{json.dumps(safe_candidates, indent=2)}
 
 Return strict JSON only with keys: selected_model, selected_cypher, reason.
 """
@@ -597,11 +1055,116 @@ Do not output cypher.
 """
 
     try:
-        summary_model = build_chat_model(st.session_state.judge_model_name)
+        summary_model = build_chat_model(st.session_state.interpreter_model_name)
         summary_resp = summary_model.invoke(summary_prompt)
         return summary_resp.content if hasattr(summary_resp, "content") else str(summary_resp)
     except Exception as e:
         return f"Unable to generate AI summary from result table: {e}"
+
+
+def is_missing_value(value):
+    if value is None:
+        return True
+    if isinstance(value, (list, tuple, set, dict)):
+        return False
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return False
+
+
+def normalize_value_for_arrow(value):
+    """Convert complex objects into JSON/string-friendly values for DataFrame display."""
+    if is_missing_value(value):
+        return None
+
+    if isinstance(value, (str, int, float, bool, bytes, date, datetime, pd.Timestamp)):
+        return value
+
+    if isinstance(value, dict):
+        return {str(key): normalize_value_for_arrow(val) for key, val in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [normalize_value_for_arrow(item) for item in value]
+
+    if hasattr(value, "labels") and hasattr(value, "properties"):
+        return {
+            "labels": list(value.labels),
+            "properties": normalize_value_for_arrow(value.properties),
+            "id": getattr(value, "id", None),
+        }
+
+    if hasattr(value, "type") and hasattr(value, "properties"):
+        return {
+            "type": getattr(value, "type", None),
+            "properties": normalize_value_for_arrow(value.properties),
+            "id": getattr(value, "id", None),
+        }
+
+    if hasattr(value, "properties"):
+        return normalize_value_for_arrow(value.properties)
+
+    return str(value)
+
+
+def build_dataframe_diagnostics(df, dataframe_name):
+    """Return per-column type diagnostics to identify Arrow-incompatible data."""
+    if df is None or df.empty:
+        return pd.DataFrame([
+            {
+                "dataframe": dataframe_name,
+                "column": "<empty>",
+                "pandas_dtype": "n/a",
+                "python_types": "n/a",
+                "sample_values": "n/a",
+            }
+        ])
+
+    diagnostic_rows = []
+    for column in df.columns:
+        series = df[column]
+        non_null = [value for value in series.tolist() if not is_missing_value(value)]
+        sample_values = [repr(normalize_value_for_arrow(value))[:120] for value in non_null[:3]]
+        python_types = sorted({type(value).__name__ for value in non_null[:10]})
+        diagnostic_rows.append(
+            {
+                "dataframe": dataframe_name,
+                "column": str(column),
+                "pandas_dtype": str(series.dtype),
+                "python_types": ", ".join(python_types) if python_types else "<all-null>",
+                "sample_values": " | ".join(sample_values) if sample_values else "<all-null>",
+            }
+        )
+    return pd.DataFrame(diagnostic_rows)
+
+
+def sanitize_dataframe_for_arrow(df):
+    """Coerce complex object columns so Streamlit can serialize them via Arrow."""
+    if df is None or df.empty:
+        return df.copy()
+
+    sanitized = df.copy()
+    for column in sanitized.columns:
+        series = sanitized[column]
+        if series.dtype == "object":
+            sanitized[column] = series.map(normalize_value_for_arrow)
+    return sanitized
+
+
+def render_dataframe_with_diagnostics(df, dataframe_name, **kwargs):
+    """Render a dataframe, and if Arrow conversion fails, show column-level diagnostics."""
+    try:
+        if pa is not None:
+            pa.Table.from_pandas(df)
+        return st.dataframe(df, **kwargs)
+    except Exception as e:
+        st.error(f"DataFrame '{dataframe_name}' is not Arrow-compatible: {e}")
+        diagnostics_df = build_dataframe_diagnostics(df, dataframe_name)
+        st.write("Arrow diagnostics")
+        st.dataframe(diagnostics_df, use_container_width=True)
+        sanitized_df = sanitize_dataframe_for_arrow(df)
+        st.warning(f"Showing sanitized fallback for '{dataframe_name}'.")
+        return st.dataframe(sanitized_df, **kwargs)
     
 def drop_date(node,date_str):
     if date_str in node.properties:
@@ -763,6 +1326,22 @@ def get_user_nodes():
         new_cypher = match_qry + "\n" + "Return " + full_prop_str
     return select_list, new_cypher
 
+# Sidebar: connection info and disconnect button
+with st.sidebar:
+    _conn_host = st.session_state.get("login_host", MEMGRAPH_HOST)
+    _conn_port = st.session_state.get("login_port", MEMGRAPH_PORT)
+    st.markdown(f"**Connected:** `{_conn_host}:{_conn_port}`")
+    if st.button("🔌 Disconnect", use_container_width=True):
+        for _k in ["db_connected", "login_host", "login_port", "login_user", "login_pass",
+                   "mem_db", "db", "tools", "graph_data", "node_df", "final_df_edge",
+                   "agent_executors", "property_value_hints", "model_configured",
+                   "model_registry", "model_option_ids", "model_discovery_errors",
+                   "generation_models", "judge_model_name", "generator_selected",
+                   "judge_selected", "interpreter_selected", "interpreter_model_name",
+                   "generator_slots", "api_key_inputs"]:
+            st.session_state.pop(_k, None)
+        st.rerun()
+
 with st.container(height=400, border=True):
 
     schema_col, user_col = st.columns([3, 2])
@@ -794,7 +1373,10 @@ with st.container(height=400, border=True):
                         st.rerun()  #refresh the page      
     
         with tab_list[1]:
-            st.dataframe(st.session_state.final_df_edge[["child", "label", "parent"]])
+            render_dataframe_with_diagnostics(
+                st.session_state.final_df_edge[["child", "label", "parent"]],
+                "schema_relationships",
+            )
         
         if(len(tab_list) > 2):
             for curr_tab in range(2,len(tab_list)):
@@ -810,8 +1392,13 @@ with st.container(height=400, border=True):
                     st.write(f"You clicked on node: **{node_name}**")
                     st.session_state.df_list = [i for i in st.session_state.df_list if node_name not in i["Node_name"]]
                     
-                    st.session_state.df_list.append({"Node_name": node_name, "dataframe": prop_df, 
-                                                     "selection": st.dataframe(prop_df, on_select="rerun", selection_mode="multi-row")})
+                    st.session_state.df_list.append({"Node_name": node_name, "dataframe": prop_df,
+                                                     "selection": render_dataframe_with_diagnostics(
+                                                         prop_df,
+                                                         f"node_properties_{node_name}",
+                                                         on_select="rerun",
+                                                         selection_mode="multi-row",
+                                                     )})
                         
     with user_col:
         user_input, cypher_output, user_cypher = st.tabs(["User Query", "Cypher Code", "User Created Cypher"])
@@ -941,21 +1528,22 @@ with st.container(height=400, border=True):
 
         if st.session_state.model_runs:
             run_rows = []
-            for model_name, run_data in st.session_state.model_runs.items():
+            for model_selector, run_data in st.session_state.model_runs.items():
                 run_rows.append({
-                    "model": model_name,
+                    "model": run_data.get("label", get_model_label(model_selector)),
                     "status": run_data.get("status", ""),
                     "elapsed_time": f"{run_data.get('elapsed_seconds', 0)}s",
                     "has_cypher": bool(run_data.get("cypher")),
                     "error": run_data.get("error", "")[:140],
                 })
             st.write("Model generation runs")
-            st.dataframe(pd.DataFrame(run_rows)) #, width=True)
+            render_dataframe_with_diagnostics(pd.DataFrame(run_rows), "model_generation_runs")
 
         if st.session_state.judge_decision:
             with st.container(border=True):
                 st.write("Judge selection")
-                st.write(f"Selected model: {st.session_state.judge_decision.get('selected_model', 'n/a')}")
+                _selected_model = st.session_state.judge_decision.get("selected_model", "")
+                st.write(f"Selected model: {get_model_label(_selected_model) if _selected_model else 'n/a'}")
                 st.write(st.session_state.judge_decision.get("reason", ""))
                 validation_notes = st.session_state.judge_decision.get("validation_notes", "")
                 if validation_notes:
@@ -963,15 +1551,28 @@ with st.container(height=400, border=True):
                 repair_log = st.session_state.judge_decision.get("repair_log", [])
                 if repair_log:
                     st.write("EXPLAIN repair log")
-                    st.dataframe(pd.DataFrame(repair_log), width=True)
+                    render_dataframe_with_diagnostics(pd.DataFrame(repair_log), "explain_repair_log", width=True)
 
         if st.session_state.cypher_str != "":
             try:
                 query = st.session_state.cypher_str.strip()
+                # ── Stage 3: final keyword guard before execution ─────────────
+                _blocked_kw = contains_write_keywords(query)
+                if _blocked_kw:
+                    st.error(
+                        f"🚫 Stage-3 safety block: the query contains a forbidden "
+                        f"write keyword ('{_blocked_kw}') and will not be executed."
+                    )
+                    st.session_state.df = pd.DataFrame()
+                    st.session_state.result_summary = "Query blocked by write-keyword guard."
+                    raise ValueError(f"Write keyword '{_blocked_kw}' blocked at execution stage.")
+                # ─────────────────────────────────────────────────────────────
                 st.session_state.mem_db.cursor.execute(query)
                 result = st.session_state.mem_db.cursor.fetchall()
                 columns = [desc.name for desc in st.session_state.mem_db.cursor.description]
-                st.session_state.df = pd.DataFrame(result, columns=columns)
+                raw_result_df = pd.DataFrame(result, columns=columns)
+                st.session_state.df_arrow_diagnostics = build_dataframe_diagnostics(raw_result_df, "query_results")
+                st.session_state.df = sanitize_dataframe_for_arrow(raw_result_df)
 
                 if st.session_state.last_summary_query != query:
                     st.session_state.result_summary = summarize_result_table(
@@ -998,7 +1599,13 @@ with st.container(height=400, border=True):
             st.write("Result Table")
      #   with st.container(border=True):
             if not st.session_state.df.empty:
-                st.dataframe(st.session_state.df) #, width=True)
+                render_dataframe_with_diagnostics(st.session_state.df, "query_results_table")
+                if "df_arrow_diagnostics" in st.session_state and not st.session_state.df_arrow_diagnostics.empty:
+                    with st.expander("Result dataframe column diagnostics"):
+                        render_dataframe_with_diagnostics(
+                            st.session_state.df_arrow_diagnostics,
+                            "query_results_diagnostics",
+                        )
             else:
                 st.write("no data to display")
 

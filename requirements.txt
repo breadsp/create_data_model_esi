@@ -3,6 +3,8 @@ pandas
 openpyxl
 langchain-core
 langchain-openai
+langchain-anthropic
+langchain-aws
 langchain_community
 langchain_neo4j
 langchain-classic
@@ -13,3 +15,5 @@ pymgclient
 streamlit>=1.20.0
 streamlit_chat
 streamlit_chatbox
+python-dotenv
+boto3
